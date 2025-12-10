@@ -9,6 +9,11 @@ Then:
   • Detect frame rate → output/XXX/framerate.txt
   • Run: srt2subtitles subtitles.srt <fps>
   • Save converted subtitles into same folder
+
++ Optional modifications:
+  • --position "X Y"      → update <param name="Position" value="...">
+  • --font "FontName"     → update font attributes
+  • --fontsize 48         → update fontSize attributes
 """
 
 import argparse
@@ -19,6 +24,7 @@ import shutil
 import re
 import subprocess
 from datetime import timedelta
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 # -----------------------------
@@ -133,8 +139,36 @@ def run_node_srt2subtitles(srt_path: str, fps: float, out_folder: str):
         print("Error running srt2subtitles:", e.output.decode())
         return None
 
-    # The tool always generates subtitles.fcpxml
     return "subtitles.fcpxml"
+
+# -----------------------------
+# Modify XML: position, font, fontsize
+# -----------------------------
+def modify_fcpxml(fcpx_path, position=None, font=None, fontsize=None):
+    if not os.path.exists(fcpx_path):
+        print("⚠ Could not modify XML: file missing:", fcpx_path)
+        return
+
+    tree = ET.parse(fcpx_path)
+    root = tree.getroot()
+
+    for elem in root.iter():
+
+        # --- POSITION ---
+        if position and elem.tag.lower().endswith("param"):
+            if elem.attrib.get("name") == "Position":
+                elem.set("value", position)
+
+        # --- FONT ---
+        if font and "font" in elem.attrib:
+            elem.set("font", font)
+
+        # --- FONT SIZE ---
+        if fontsize and "fontSize" in elem.attrib:
+            elem.set("fontSize", str(fontsize))
+
+    tree.write(fcpx_path, encoding="utf-8", xml_declaration=True)
+    print(f"🔧 Updated subtitles: position/font/fontsize applied → {fcpx_path}")
 
 # -----------------------------
 # Main program
@@ -142,6 +176,12 @@ def run_node_srt2subtitles(srt_path: str, fps: float, out_folder: str):
 def main():
     parser = argparse.ArgumentParser(description="Generate SRT, detect FPS, run node conversion.")
     parser.add_argument("input", help="Local video/audio file OR YouTube URL")
+
+    # --- New style flags ---
+    parser.add_argument("--position", type=str, help='Position "X Y", e.g. "0 -300"')
+    parser.add_argument("--font", type=str, help='Font family, e.g. "Helvetica"')
+    parser.add_argument("--fontsize", type=int, help="Font size in pixels")
+
     args = parser.parse_args()
 
     check_ffmpeg()
@@ -200,7 +240,7 @@ def main():
     # 6. Run node conversion
     converted = run_node_srt2subtitles(srt_path, fps, out_folder)
 
-    # Explicit expected file
+    # Expected FCPXML file
     fcpx_file = "subtitles.fcpxml"
     fcpx_src = os.path.join(os.getcwd(), fcpx_file)
     fcpx_dest = os.path.join(out_folder, fcpx_file)
@@ -212,6 +252,14 @@ def main():
         print(f"✅ Final Cut file already in output: {fcpx_dest}")
     else:
         print("⚠ subtitles.fcpxml not found!")
+
+    # 7. Apply modifications
+    modify_fcpxml(
+        fcpx_dest,
+        position=args.position,
+        font=args.font,
+        fontsize=args.fontsize
+    )
 
 if __name__ == "__main__":
     main()
