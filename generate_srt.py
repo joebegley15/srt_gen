@@ -11,7 +11,7 @@ Then (for each media item):
   • Detect frame rate → output/XXX/framerate.txt
   • Run: srt2subtitles subtitles.srt <fps>
   • Move subtitles.fcpxml into same folder
-  • Optionally modify FCPXML (position/font/fontsize)
+  • Optionally modify FCPXML (position/font/fontsize/lineSpacing)
   • Optional FCPXML line breaks: if --lb_chars is provided, wrap long text nodes
     by inserting XML line-break entity '&#10;' (NOT a literal newline) at word boundaries.
 
@@ -281,8 +281,6 @@ def _wrap_text_word_boundary_to_token(s: str, max_chars: int) -> str:
     if not s or max_chars is None or max_chars <= 0:
         return s
 
-    # treat any existing hard breaks as separate lines
-    # (if any exist, we preserve them by splitting and re-wrapping per line)
     lines = s.splitlines()
     out_lines = []
 
@@ -310,7 +308,6 @@ def _wrap_text_word_boundary_to_token(s: str, max_chars: int) -> str:
                     cur = cur[max_chars:]
         out_lines.append(cur)
 
-    # join with placeholder token, not a literal newline
     return _LB_TOKEN.join([x for x in out_lines if x != ""])
 
 def apply_fcpxml_line_breaks_entity(fcpx_path: str, line_break_chars: int) -> bool:
@@ -337,7 +334,6 @@ def apply_fcpxml_line_breaks_entity(fcpx_path: str, line_break_chars: int) -> bo
     for elem in root.iter():
         if elem.text and isinstance(elem.text, str):
             raw = elem.text
-            # Only wrap when long and has spaces
             if len(raw.strip()) > line_break_chars and " " in raw:
                 wrapped = _wrap_text_word_boundary_to_token(raw, line_break_chars)
                 if wrapped != raw:
@@ -347,10 +343,8 @@ def apply_fcpxml_line_breaks_entity(fcpx_path: str, line_break_chars: int) -> bo
     if not changed:
         return False
 
-    # Write XML (with placeholder tokens in text)
     tree.write(fcpx_path, encoding="utf-8", xml_declaration=True)
 
-    # Replace placeholder token with XML line break entity
     try:
         xml = Path(fcpx_path).read_text(encoding="utf-8")
         if _LB_TOKEN in xml:
@@ -364,13 +358,14 @@ def apply_fcpxml_line_breaks_entity(fcpx_path: str, line_break_chars: int) -> bo
     return True
 
 # -----------------------------
-# Modify XML: position, font, fontsize (+ optional line breaks)
+# Modify XML: position, font, fontsize, lineSpacing (+ optional line breaks)
 # -----------------------------
 def modify_fcpxml(
     fcpx_path,
     position=None,
     font=None,
     fontsize=None,
+    line_spacing=None,
     line_break_chars=None,
 ):
     if not os.path.exists(fcpx_path):
@@ -385,19 +380,21 @@ def modify_fcpxml(
             if elem.attrib.get("name") == "Position":
                 elem.set("value", position)
 
+        # Add lineSpacing right where you modify font (same element set)
         if font and "font" in elem.attrib:
             elem.set("font", font)
+            if line_spacing is not None:
+                elem.set("lineSpacing", str(int(line_spacing)))
 
         if fontsize and "fontSize" in elem.attrib:
             elem.set("fontSize", str(fontsize))
 
     tree.write(fcpx_path, encoding="utf-8", xml_declaration=True)
 
-    # OFF by default, ON only if --lb_chars is provided
     if line_break_chars is not None:
         apply_fcpxml_line_breaks_entity(fcpx_path, int(line_break_chars))
 
-    print(f"🔧 Updated subtitles: position/font/fontsize applied → {fcpx_path}")
+    print(f"🔧 Updated subtitles: position/font/fontsize/lineSpacing applied → {fcpx_path}")
 
 # -----------------------------
 # Helpers: batch file discovery
@@ -425,6 +422,7 @@ def process_one(
     position=None,
     font=None,
     fontsize=None,
+    line_spacing=None,
     cadence=False,
     max_words=7,
     max_chars=42,
@@ -502,6 +500,7 @@ def process_one(
         position=position,
         font=font,
         fontsize=fontsize,
+        line_spacing=line_spacing,
         line_break_chars=line_break_chars,
     )
 
@@ -518,13 +517,20 @@ def main():
     parser.add_argument("--font", type=str, help='Font family, e.g. "Helvetica"')
     parser.add_argument("--fontsize", type=int, help="Font size in pixels")
 
+    # NEW: line spacing (can be negative)
+    parser.add_argument(
+        "--line-spacing",
+        dest="line_spacing",
+        type=int,
+        default=None,
+        help='Add lineSpacing="N" (can be negative). Applied on the same element(s) where font is set.',
+    )
+
     parser.add_argument("--cadence", action="store_true", help="Split subtitles into shorter, cadence-friendly chunks")
     parser.add_argument("--max-words", type=int, default=7, help="Cadence: max words per subtitle (default: 7)")
     parser.add_argument("--max-chars", type=int, default=42, help="Cadence: max characters per subtitle (default: 42)")
     parser.add_argument("--max-duration", type=float, default=2.6, help="Cadence: max seconds per subtitle (default: 2.6)")
 
-    # IMPORTANT: underscores in your CLI won't work because argparse normalizes to dashes.
-    # You want: --lb_chars 20
     parser.add_argument(
         "--lb_chars",
         dest="lb_chars",
@@ -545,6 +551,7 @@ def main():
                 position=args.position,
                 font=args.font,
                 fontsize=args.fontsize,
+                line_spacing=args.line_spacing,
                 cadence=args.cadence,
                 max_words=args.max_words,
                 max_chars=args.max_chars,
@@ -564,6 +571,7 @@ def main():
         position=args.position,
         font=args.font,
         fontsize=args.fontsize,
+        line_spacing=args.line_spacing,
         cadence=args.cadence,
         max_words=args.max_words,
         max_chars=args.max_chars,
