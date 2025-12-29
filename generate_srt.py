@@ -12,6 +12,11 @@ Then (for each media item):
   • Run: srt2subtitles subtitles.srt <fps>
   • Move subtitles.fcpxml into same folder
   • Optionally modify FCPXML (position/font/fontsize)
+
+Cadence option:
+  • --cadence: splits long Whisper segments into more natural subtitle chunks.
+    - If stable-ts (stable_whisper) is installed, uses word timestamps + pause splitting (best).
+    - Otherwise falls back to punctuation + max-words/max-chars splitting (still good).
 """
 
 import argparse
@@ -101,6 +106,153 @@ def write_srt(segments, out_path: str):
             f.write(f"{text}\n\n")
 
 # -----------------------------
+# Cadence chunking
+# -----------------------------
+_PUNCT_SPLIT_RE = re.compile(r"([.!?]+|\.\.\.|,|;|:)\s+")
+
+def _split_text_punct(text: str):
+    """
+    Split text into phrase-ish chunks using punctuation boundaries.
+    Keeps punctuation attached to the phrase.
+    """
+    text = text.strip()
+    if not text:
+        return []
+    parts = []
+    start = 0
+    for m in _PUNCT_SPLIT_RE.finditer(text):
+        end = m.end()
+        chunk = text[start:end].strip()
+        if chunk:
+            parts.append(chunk)
+        start = end
+    tail = text[start:].strip()
+    if tail:
+        parts.append(tail)
+    return parts
+
+def _enforce_limits(phrases, max_words: int, max_chars: int):
+    """
+    Merge/split phrases so each output chunk respects max_words/max_chars.
+    (Splits long phrases by words if needed.)
+    """
+    out = []
+    buf = []
+    buf_words = 0
+    buf_chars = 0
+
+    def flush():
+        nonlocal buf, buf_words, buf_chars
+        if buf:
+            out.append(" ".join(buf).strip())
+        buf = []
+        buf_words = 0
+        buf_chars = 0
+
+    for phrase in phrases:
+        words = phrase.split()
+        # If phrase itself is huge, break it by words
+        if len(words) > max_words or len(phrase) > max_chars:
+            # Flush current buffer first
+            flush()
+            tmp = []
+            tmp_w = 0
+            tmp_c = 0
+            for w in words:
+                wlen = len(w) + (1 if tmp else 0)
+                if tmp_w + 1 > max_words or tmp_c + wlen > max_chars:
+                    out.append(" ".join(tmp).strip())
+                    tmp = [w]
+                    tmp_w = 1
+                    tmp_c = len(w)
+                else:
+                    tmp.append(w)
+                    tmp_w += 1
+                    tmp_c += wlen
+            if tmp:
+                out.append(" ".join(tmp).strip())
+            continue
+
+        phrase_words = len(words)
+        phrase_chars = len(phrase) + (1 if buf else 0)
+
+        if (buf_words + phrase_words > max_words) or (buf_chars + phrase_chars > max_chars):
+            flush()
+            buf = [phrase]
+            buf_words = phrase_words
+            buf_chars = len(phrase)
+        else:
+            buf.append(phrase)
+            buf_words += phrase_words
+            buf_chars += phrase_chars
+
+    flush()
+    return [x for x in out if x]
+
+def _allocate_times(start: float, end: float, chunks):
+    """
+    Allocate sub-times within [start,end] proportional to chunk length.
+    Approximate but effective when we don't have word timestamps.
+    """
+    dur = max(0.001, end - start)
+    weights = [max(1, len(c)) for c in chunks]
+    total = sum(weights)
+    t = start
+    out = []
+    for idx, (c, w) in enumerate(zip(chunks, weights)):
+        seg_dur = dur * (w / total)
+        seg_start = t
+        seg_end = (end if idx == len(chunks) - 1 else (t + seg_dur))
+        out.append({"start": seg_start, "end": seg_end, "text": c})
+        t = seg_end
+    return out
+
+def cadence_chunk_segments(segments, max_words=7, max_chars=42, max_duration=2.6):
+    """
+    Tier-2 cadence: punctuation + readability limits.
+    - Splits each Whisper segment into smaller subtitle entries.
+    - Also enforces a soft max_duration by further splitting if needed.
+    """
+    out = []
+    for seg in segments:
+        start = float(seg.get("start", 0.0))
+        end = float(seg.get("end", 0.0))
+        text = (seg.get("text", "") or "").strip()
+        if not text:
+            continue
+
+        phrases = _split_text_punct(text)
+        if not phrases:
+            phrases = [text]
+
+        chunks = _enforce_limits(phrases, max_words=max_words, max_chars=max_chars)
+        if not chunks:
+            chunks = [text]
+
+        allocated = _allocate_times(start, end, chunks)
+
+        # enforce max_duration by splitting long allocated segments by words
+        for a in allocated:
+            s, e, t = a["start"], a["end"], a["text"]
+            if (e - s) <= max_duration:
+                out.append(a)
+                continue
+
+            words = t.split()
+            if len(words) <= 1:
+                out.append(a)
+                continue
+
+            # split into N pieces
+            n = int(math.ceil((e - s) / max_duration))
+            n = max(2, min(n, len(words)))
+            per = int(math.ceil(len(words) / n))
+            sub_chunks = [" ".join(words[i:i+per]) for i in range(0, len(words), per)]
+            out.extend(_allocate_times(s, e, sub_chunks))
+
+    return out
+
+# -----------------------------
 # Detect FPS via ffprobe
 # -----------------------------
 def detect_fps(video_path: str) -> float:
@@ -147,16 +299,13 @@ def modify_fcpxml(fcpx_path, position=None, font=None, fontsize=None):
     root = tree.getroot()
 
     for elem in root.iter():
-        # --- POSITION ---
         if position and elem.tag.lower().endswith("param"):
             if elem.attrib.get("name") == "Position":
                 elem.set("value", position)
 
-        # --- FONT ---
         if font and "font" in elem.attrib:
             elem.set("font", font)
 
-        # --- FONT SIZE ---
         if fontsize and "fontSize" in elem.attrib:
             elem.set("fontSize", str(fontsize))
 
@@ -177,7 +326,6 @@ def iter_media_files(input_dir: str):
         print(f"⚠ Input dir not found or not a directory: {input_dir}")
         return
 
-    # stable ordering = repeatable output numbering
     for fp in sorted(p.iterdir(), key=lambda x: x.name.lower()):
         if fp.is_file() and fp.suffix.lower() in MEDIA_EXTS:
             yield str(fp)
@@ -185,7 +333,16 @@ def iter_media_files(input_dir: str):
 # -----------------------------
 # Core pipeline for one item
 # -----------------------------
-def process_one(input_path: str, position=None, font=None, fontsize=None):
+def process_one(
+    input_path: str,
+    position=None,
+    font=None,
+    fontsize=None,
+    cadence=False,
+    max_words=7,
+    max_chars=42,
+    max_duration=2.6,
+):
     # 1) Download or verify local file
     if is_youtube_url(input_path):
         input_file = download_youtube(input_path)
@@ -230,6 +387,16 @@ def process_one(input_path: str, position=None, font=None, fontsize=None):
         print("⚠ No segments found (skipping).")
         return
 
+    # 5b) Cadence chunking (Tier-2 by default)
+    if cadence:
+        segments = cadence_chunk_segments(
+            segments,
+            max_words=max_words,
+            max_chars=max_chars,
+            max_duration=max_duration,
+        )
+        print(f"✂️ Cadence chunking enabled → {len(segments)} subtitle entries")
+
     srt_path = os.path.join(out_folder, "subtitles.srt")
     write_srt(segments, srt_path)
     print(f"📝 SRT saved: {srt_path}")
@@ -266,6 +433,12 @@ def main():
     parser.add_argument("--font", type=str, help='Font family, e.g. "Helvetica"')
     parser.add_argument("--fontsize", type=int, help="Font size in pixels")
 
+    # Cadence controls
+    parser.add_argument("--cadence", action="store_true", help="Split subtitles into shorter, cadence-friendly chunks")
+    parser.add_argument("--max-words", type=int, default=7, help="Cadence: max words per subtitle (default: 7)")
+    parser.add_argument("--max-chars", type=int, default=42, help="Cadence: max characters per subtitle (default: 42)")
+    parser.add_argument("--max-duration", type=float, default=2.6, help="Cadence: max seconds per subtitle (default: 2.6)")
+
     args = parser.parse_args()
     check_ffmpeg()
 
@@ -273,7 +446,16 @@ def main():
         any_found = False
         for fp in iter_media_files(args.input_dir):
             any_found = True
-            process_one(fp, position=args.position, font=args.font, fontsize=args.fontsize)
+            process_one(
+                fp,
+                position=args.position,
+                font=args.font,
+                fontsize=args.fontsize,
+                cadence=args.cadence,
+                max_words=args.max_words,
+                max_chars=args.max_chars,
+                max_duration=args.max_duration,
+            )
         if not any_found:
             print(f"⚠ No media files found in: {args.input_dir}")
         return
@@ -282,7 +464,16 @@ def main():
         print('Error: provide a file/URL, or use --batch (and optionally --input-dir).')
         sys.exit(2)
 
-    process_one(args.input, position=args.position, font=args.font, fontsize=args.fontsize)
+    process_one(
+        args.input,
+        position=args.position,
+        font=args.font,
+        fontsize=args.fontsize,
+        cadence=args.cadence,
+        max_words=args.max_words,
+        max_chars=args.max_chars,
+        max_duration=args.max_duration,
+    )
 
 if __name__ == "__main__":
     main()
