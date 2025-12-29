@@ -3,17 +3,15 @@
 generate_srt.py — Create SRT subtitles from:
   • a local video/audio file
   • a YouTube URL
+  • OR batch-process all media files in an input directory (default: input/)
 
-Then:
+Then (for each media item):
+  • Create output/XXX/ (auto-increment)
   • Move media into output/XXX/
   • Detect frame rate → output/XXX/framerate.txt
   • Run: srt2subtitles subtitles.srt <fps>
-  • Save converted subtitles into same folder
-
-+ Optional modifications:
-  • --position "X Y"      → update <param name="Position" value="...">
-  • --font "FontName"     → update font attributes
-  • --fontsize 48         → update fontSize attributes
+  • Move subtitles.fcpxml into same folder
+  • Optionally modify FCPXML (position/font/fontsize)
 """
 
 import argparse
@@ -32,9 +30,7 @@ from pathlib import Path
 # -----------------------------
 def check_ffmpeg():
     if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
-        sys.stderr.write(
-            "Error: ffmpeg or ffprobe not found. Install ffmpeg.\n"
-        )
+        sys.stderr.write("Error: ffmpeg or ffprobe not found. Install ffmpeg.\n")
         sys.exit(1)
 
 # -----------------------------
@@ -129,16 +125,14 @@ def detect_fps(video_path: str) -> float:
 # -----------------------------
 # Run node command
 # -----------------------------
-def run_node_srt2subtitles(srt_path: str, fps: float, out_folder: str):
+def run_node_srt2subtitles(srt_path: str, fps: float):
     cmd = ["srt2subtitles", srt_path, str(int(fps))]
     print(f"Running: {' '.join(cmd)}")
-    
     try:
-        subprocess.check_output(cmd)
+        subprocess.check_output(cmd, stderr=subprocess.STDOUT)
     except subprocess.CalledProcessError as e:
-        print("Error running srt2subtitles:", e.output.decode())
+        print("Error running srt2subtitles:\n", e.output.decode(errors="replace"))
         return None
-
     return "subtitles.fcpxml"
 
 # -----------------------------
@@ -153,7 +147,6 @@ def modify_fcpxml(fcpx_path, position=None, font=None, fontsize=None):
     root = tree.getroot()
 
     for elem in root.iter():
-
         # --- POSITION ---
         if position and elem.tag.lower().endswith("param"):
             if elem.attrib.get("name") == "Position":
@@ -171,36 +164,41 @@ def modify_fcpxml(fcpx_path, position=None, font=None, fontsize=None):
     print(f"🔧 Updated subtitles: position/font/fontsize applied → {fcpx_path}")
 
 # -----------------------------
-# Main program
+# Helpers: batch file discovery
 # -----------------------------
-def main():
-    parser = argparse.ArgumentParser(description="Generate SRT, detect FPS, run node conversion.")
-    parser.add_argument("input", help="Local video/audio file OR YouTube URL")
+MEDIA_EXTS = {
+    ".mp4", ".mov", ".mkv", ".webm", ".m4v", ".avi",
+    ".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg"
+}
 
-    # --- New style flags ---
-    parser.add_argument("--position", type=str, help='Position "X Y", e.g. "0 -300"')
-    parser.add_argument("--font", type=str, help='Font family, e.g. "Helvetica"')
-    parser.add_argument("--fontsize", type=int, help="Font size in pixels")
+def iter_media_files(input_dir: str):
+    p = Path(input_dir)
+    if not p.exists() or not p.is_dir():
+        print(f"⚠ Input dir not found or not a directory: {input_dir}")
+        return
 
-    args = parser.parse_args()
+    # stable ordering = repeatable output numbering
+    for fp in sorted(p.iterdir(), key=lambda x: x.name.lower()):
+        if fp.is_file() and fp.suffix.lower() in MEDIA_EXTS:
+            yield str(fp)
 
-    check_ffmpeg()
-
-    input_path = args.input
-
-    # 1. Download or verify file
+# -----------------------------
+# Core pipeline for one item
+# -----------------------------
+def process_one(input_path: str, position=None, font=None, fontsize=None):
+    # 1) Download or verify local file
     if is_youtube_url(input_path):
         input_file = download_youtube(input_path)
     else:
         if not os.path.isfile(input_path):
-            sys.stderr.write(f"Error: input file not found: {input_path}\n")
-            sys.exit(1)
+            print(f"Error: input file not found: {input_path}")
+            return
         input_file = input_path
 
-    # 2. Create output folder
+    # 2) Create output folder
     out_folder = next_output_folder()
 
-    # 3. Move video into folder
+    # 3) Move media into folder
     media_name = os.path.basename(input_file)
     dest_media_path = os.path.join(out_folder, media_name)
 
@@ -208,17 +206,17 @@ def main():
         shutil.move(input_file, dest_media_path)
         input_file = dest_media_path
 
-    print(f"📁 Media moved to {dest_media_path}")
+    print(f"\n📁 Processing: {media_name}")
+    print(f"📁 Media moved to: {dest_media_path}")
 
-    # 4. Detect frame rate
+    # 4) Detect frame rate
     fps = detect_fps(input_file)
     print(f"🎞 Detected FPS: {fps}")
 
-    # Write framerate.txt
     with open(os.path.join(out_folder, "framerate.txt"), "w") as f:
         f.write(str(fps))
 
-    # 5. TRANSCRIBE using Whisper
+    # 5) Transcribe with Whisper
     import torch
     import whisper
 
@@ -229,18 +227,17 @@ def main():
     result = model.transcribe(input_file, verbose=False)
     segments = result.get("segments", [])
     if not segments:
-        print("No segments found!")
-        sys.exit(1)
+        print("⚠ No segments found (skipping).")
+        return
 
-    # Save SRT
     srt_path = os.path.join(out_folder, "subtitles.srt")
     write_srt(segments, srt_path)
     print(f"📝 SRT saved: {srt_path}")
 
-    # 6. Run node conversion
-    converted = run_node_srt2subtitles(srt_path, fps, out_folder)
+    # 6) Run node conversion (writes subtitles.fcpxml in CWD)
+    run_node_srt2subtitles(srt_path, fps)
 
-    # Expected FCPXML file
+    # 7) Move fcpxml into output folder
     fcpx_file = "subtitles.fcpxml"
     fcpx_src = os.path.join(os.getcwd(), fcpx_file)
     fcpx_dest = os.path.join(out_folder, fcpx_file)
@@ -253,13 +250,39 @@ def main():
     else:
         print("⚠ subtitles.fcpxml not found!")
 
-    # 7. Apply modifications
-    modify_fcpxml(
-        fcpx_dest,
-        position=args.position,
-        font=args.font,
-        fontsize=args.fontsize
-    )
+    # 8) Apply modifications
+    modify_fcpxml(fcpx_dest, position=position, font=font, fontsize=fontsize)
+
+# -----------------------------
+# Main program
+# -----------------------------
+def main():
+    parser = argparse.ArgumentParser(description="Generate SRT + FCPXML for one input or a whole directory.")
+    parser.add_argument("input", nargs="?", help="Local media file OR YouTube URL (omit if using --batch)")
+    parser.add_argument("--batch", action="store_true", help='Process all media files in --input-dir (default "input")')
+    parser.add_argument("--input-dir", default="input", help='Directory to scan in batch mode (default: "input")')
+
+    parser.add_argument("--position", type=str, help='Position "X Y", e.g. "0 -300"')
+    parser.add_argument("--font", type=str, help='Font family, e.g. "Helvetica"')
+    parser.add_argument("--fontsize", type=int, help="Font size in pixels")
+
+    args = parser.parse_args()
+    check_ffmpeg()
+
+    if args.batch:
+        any_found = False
+        for fp in iter_media_files(args.input_dir):
+            any_found = True
+            process_one(fp, position=args.position, font=args.font, fontsize=args.fontsize)
+        if not any_found:
+            print(f"⚠ No media files found in: {args.input_dir}")
+        return
+
+    if not args.input:
+        print('Error: provide a file/URL, or use --batch (and optionally --input-dir).')
+        sys.exit(2)
+
+    process_one(args.input, position=args.position, font=args.font, fontsize=args.fontsize)
 
 if __name__ == "__main__":
     main()
