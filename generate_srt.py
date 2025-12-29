@@ -257,7 +257,7 @@ def detect_fps(video_path: str) -> float:
 # Run node command
 # -----------------------------
 def run_node_srt2subtitles(srt_path: str, fps: float):
-    cmd = ["srt2subtitles", srt_path, str(int(fps))]
+    cmd = ["srt2subtitles", srt_path, str(round(fps))]
     print(f"Running: {' '.join(cmd)}")
     try:
         subprocess.check_output(cmd, stderr=subprocess.STDOUT)
