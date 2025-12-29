@@ -12,11 +12,12 @@ Then (for each media item):
   • Run: srt2subtitles subtitles.srt <fps>
   • Move subtitles.fcpxml into same folder
   • Optionally modify FCPXML (position/font/fontsize)
+  • Optional FCPXML line breaks: if --lb_chars is provided, wrap long text nodes
+    by inserting XML line-break entity '&#10;' (NOT a literal newline) at word boundaries.
 
 Cadence option:
   • --cadence: splits long Whisper segments into more natural subtitle chunks.
-    - If stable-ts (stable_whisper) is installed, uses word timestamps + pause splitting (best).
-    - Otherwise falls back to punctuation + max-words/max-chars splitting (still good).
+    - Otherwise punctuation + max-words/max-chars splitting.
 """
 
 import argparse
@@ -111,10 +112,7 @@ def write_srt(segments, out_path: str):
 _PUNCT_SPLIT_RE = re.compile(r"([.!?]+|\.\.\.|,|;|:)\s+")
 
 def _split_text_punct(text: str):
-    """
-    Split text into phrase-ish chunks using punctuation boundaries.
-    Keeps punctuation attached to the phrase.
-    """
+    """Split text into phrase-ish chunks using punctuation boundaries."""
     text = text.strip()
     if not text:
         return []
@@ -132,10 +130,7 @@ def _split_text_punct(text: str):
     return parts
 
 def _enforce_limits(phrases, max_words: int, max_chars: int):
-    """
-    Merge/split phrases so each output chunk respects max_words/max_chars.
-    (Splits long phrases by words if needed.)
-    """
+    """Merge/split phrases so each output chunk respects max_words/max_chars."""
     out = []
     buf = []
     buf_words = 0
@@ -153,7 +148,6 @@ def _enforce_limits(phrases, max_words: int, max_chars: int):
         words = phrase.split()
         # If phrase itself is huge, break it by words
         if len(words) > max_words or len(phrase) > max_chars:
-            # Flush current buffer first
             flush()
             tmp = []
             tmp_w = 0
@@ -190,10 +184,7 @@ def _enforce_limits(phrases, max_words: int, max_chars: int):
     return [x for x in out if x]
 
 def _allocate_times(start: float, end: float, chunks):
-    """
-    Allocate sub-times within [start,end] proportional to chunk length.
-    Approximate but effective when we don't have word timestamps.
-    """
+    """Allocate sub-times within [start,end] proportional to chunk length."""
     dur = max(0.001, end - start)
     weights = [max(1, len(c)) for c in chunks]
     total = sum(weights)
@@ -208,11 +199,7 @@ def _allocate_times(start: float, end: float, chunks):
     return out
 
 def cadence_chunk_segments(segments, max_words=7, max_chars=42, max_duration=2.6):
-    """
-    Tier-2 cadence: punctuation + readability limits.
-    - Splits each Whisper segment into smaller subtitle entries.
-    - Also enforces a soft max_duration by further splitting if needed.
-    """
+    """Tier-2 cadence: punctuation + readability limits + soft max_duration."""
     out = []
     for seg in segments:
         start = float(seg.get("start", 0.0))
@@ -221,17 +208,10 @@ def cadence_chunk_segments(segments, max_words=7, max_chars=42, max_duration=2.6
         if not text:
             continue
 
-        phrases = _split_text_punct(text)
-        if not phrases:
-            phrases = [text]
-
-        chunks = _enforce_limits(phrases, max_words=max_words, max_chars=max_chars)
-        if not chunks:
-            chunks = [text]
-
+        phrases = _split_text_punct(text) or [text]
+        chunks = _enforce_limits(phrases, max_words=max_words, max_chars=max_chars) or [text]
         allocated = _allocate_times(start, end, chunks)
 
-        # enforce max_duration by splitting long allocated segments by words
         for a in allocated:
             s, e, t = a["start"], a["end"], a["text"]
             if (e - s) <= max_duration:
@@ -243,7 +223,6 @@ def cadence_chunk_segments(segments, max_words=7, max_chars=42, max_duration=2.6
                 out.append(a)
                 continue
 
-            # split into N pieces
             n = int(math.ceil((e - s) / max_duration))
             n = max(2, min(n, len(words)))
             per = int(math.ceil(len(words) / n))
@@ -288,9 +267,112 @@ def run_node_srt2subtitles(srt_path: str, fps: float):
     return "subtitles.fcpxml"
 
 # -----------------------------
-# Modify XML: position, font, fontsize
+# Line-break helper for FCPXML text nodes
 # -----------------------------
-def modify_fcpxml(fcpx_path, position=None, font=None, fontsize=None):
+# We cannot force ElementTree to emit '&#10;' for newlines inside text nodes.
+# So we insert a unique placeholder token and do a file-level replacement to '&#10;'.
+_LB_TOKEN = "__FCPXML_LINEBREAK__"
+
+def _wrap_text_word_boundary_to_token(s: str, max_chars: int) -> str:
+    """
+    Wrap lines at word boundaries, inserting _LB_TOKEN between lines.
+    (Later replaced in the saved XML with '&#10;'.)
+    """
+    if not s or max_chars is None or max_chars <= 0:
+        return s
+
+    # treat any existing hard breaks as separate lines
+    # (if any exist, we preserve them by splitting and re-wrapping per line)
+    lines = s.splitlines()
+    out_lines = []
+
+    for line in lines:
+        line = line.strip()
+        if len(line) <= max_chars:
+            out_lines.append(line)
+            continue
+
+        words = line.split()
+        if not words:
+            out_lines.append(line)
+            continue
+
+        cur = words[0]
+        for w in words[1:]:
+            candidate = cur + " " + w
+            if len(candidate) <= max_chars:
+                cur = candidate
+            else:
+                out_lines.append(cur)
+                cur = w
+                while len(cur) > max_chars:
+                    out_lines.append(cur[:max_chars])
+                    cur = cur[max_chars:]
+        out_lines.append(cur)
+
+    # join with placeholder token, not a literal newline
+    return _LB_TOKEN.join([x for x in out_lines if x != ""])
+
+def apply_fcpxml_line_breaks_entity(fcpx_path: str, line_break_chars: int) -> bool:
+    """
+    Wrap text nodes by inserting '&#10;' line breaks.
+    Implementation:
+      1) Replace text with placeholder token between wrapped lines
+      2) Save XML
+      3) Replace placeholder token in the file with '&#10;'
+    Returns True if any changes were made.
+    """
+    if not os.path.exists(fcpx_path):
+        print("⚠ Could not apply line breaks: file missing:", fcpx_path)
+        return False
+
+    try:
+        tree = ET.parse(fcpx_path)
+        root = tree.getroot()
+    except Exception as e:
+        print(f"⚠ Could not parse FCPXML for line breaks: {e}")
+        return False
+
+    changed = False
+    for elem in root.iter():
+        if elem.text and isinstance(elem.text, str):
+            raw = elem.text
+            # Only wrap when long and has spaces
+            if len(raw.strip()) > line_break_chars and " " in raw:
+                wrapped = _wrap_text_word_boundary_to_token(raw, line_break_chars)
+                if wrapped != raw:
+                    elem.text = wrapped
+                    changed = True
+
+    if not changed:
+        return False
+
+    # Write XML (with placeholder tokens in text)
+    tree.write(fcpx_path, encoding="utf-8", xml_declaration=True)
+
+    # Replace placeholder token with XML line break entity
+    try:
+        xml = Path(fcpx_path).read_text(encoding="utf-8")
+        if _LB_TOKEN in xml:
+            xml = xml.replace(_LB_TOKEN, "&#10;")
+            Path(fcpx_path).write_text(xml, encoding="utf-8")
+        print(f"↩️ Inserted line breaks as '&#10;' (>{line_break_chars} chars) → {fcpx_path}")
+    except Exception as e:
+        print(f"⚠ Failed to post-process '&#10;' replacement: {e}")
+        return False
+
+    return True
+
+# -----------------------------
+# Modify XML: position, font, fontsize (+ optional line breaks)
+# -----------------------------
+def modify_fcpxml(
+    fcpx_path,
+    position=None,
+    font=None,
+    fontsize=None,
+    line_break_chars=None,
+):
     if not os.path.exists(fcpx_path):
         print("⚠ Could not modify XML: file missing:", fcpx_path)
         return
@@ -310,6 +392,11 @@ def modify_fcpxml(fcpx_path, position=None, font=None, fontsize=None):
             elem.set("fontSize", str(fontsize))
 
     tree.write(fcpx_path, encoding="utf-8", xml_declaration=True)
+
+    # OFF by default, ON only if --lb_chars is provided
+    if line_break_chars is not None:
+        apply_fcpxml_line_breaks_entity(fcpx_path, int(line_break_chars))
+
     print(f"🔧 Updated subtitles: position/font/fontsize applied → {fcpx_path}")
 
 # -----------------------------
@@ -342,8 +429,8 @@ def process_one(
     max_words=7,
     max_chars=42,
     max_duration=2.6,
+    line_break_chars=None,
 ):
-    # 1) Download or verify local file
     if is_youtube_url(input_path):
         input_file = download_youtube(input_path)
     else:
@@ -352,10 +439,8 @@ def process_one(
             return
         input_file = input_path
 
-    # 2) Create output folder
     out_folder = next_output_folder()
 
-    # 3) Move media into folder
     media_name = os.path.basename(input_file)
     dest_media_path = os.path.join(out_folder, media_name)
 
@@ -366,14 +451,12 @@ def process_one(
     print(f"\n📁 Processing: {media_name}")
     print(f"📁 Media moved to: {dest_media_path}")
 
-    # 4) Detect frame rate
     fps = detect_fps(input_file)
     print(f"🎞 Detected FPS: {fps}")
 
     with open(os.path.join(out_folder, "framerate.txt"), "w") as f:
         f.write(str(fps))
 
-    # 5) Transcribe with Whisper
     import torch
     import whisper
 
@@ -387,7 +470,6 @@ def process_one(
         print("⚠ No segments found (skipping).")
         return
 
-    # 5b) Cadence chunking (Tier-2 by default)
     if cadence:
         segments = cadence_chunk_segments(
             segments,
@@ -401,10 +483,8 @@ def process_one(
     write_srt(segments, srt_path)
     print(f"📝 SRT saved: {srt_path}")
 
-    # 6) Run node conversion (writes subtitles.fcpxml in CWD)
     run_node_srt2subtitles(srt_path, fps)
 
-    # 7) Move fcpxml into output folder
     fcpx_file = "subtitles.fcpxml"
     fcpx_src = os.path.join(os.getcwd(), fcpx_file)
     fcpx_dest = os.path.join(out_folder, fcpx_file)
@@ -417,8 +497,13 @@ def process_one(
     else:
         print("⚠ subtitles.fcpxml not found!")
 
-    # 8) Apply modifications
-    modify_fcpxml(fcpx_dest, position=position, font=font, fontsize=fontsize)
+    modify_fcpxml(
+        fcpx_dest,
+        position=position,
+        font=font,
+        fontsize=fontsize,
+        line_break_chars=line_break_chars,
+    )
 
 # -----------------------------
 # Main program
@@ -433,11 +518,20 @@ def main():
     parser.add_argument("--font", type=str, help='Font family, e.g. "Helvetica"')
     parser.add_argument("--fontsize", type=int, help="Font size in pixels")
 
-    # Cadence controls
     parser.add_argument("--cadence", action="store_true", help="Split subtitles into shorter, cadence-friendly chunks")
     parser.add_argument("--max-words", type=int, default=7, help="Cadence: max words per subtitle (default: 7)")
     parser.add_argument("--max-chars", type=int, default=42, help="Cadence: max characters per subtitle (default: 42)")
     parser.add_argument("--max-duration", type=float, default=2.6, help="Cadence: max seconds per subtitle (default: 2.6)")
+
+    # IMPORTANT: underscores in your CLI won't work because argparse normalizes to dashes.
+    # You want: --lb_chars 20
+    parser.add_argument(
+        "--lb_chars",
+        dest="lb_chars",
+        type=int,
+        default=None,
+        help="If set, insert '&#10;' in FCPXML text nodes when text exceeds this many characters (word-boundary wrap).",
+    )
 
     args = parser.parse_args()
     check_ffmpeg()
@@ -455,6 +549,7 @@ def main():
                 max_words=args.max_words,
                 max_chars=args.max_chars,
                 max_duration=args.max_duration,
+                line_break_chars=args.lb_chars,
             )
         if not any_found:
             print(f"⚠ No media files found in: {args.input_dir}")
@@ -473,6 +568,7 @@ def main():
         max_words=args.max_words,
         max_chars=args.max_chars,
         max_duration=args.max_duration,
+        line_break_chars=args.lb_chars,
     )
 
 if __name__ == "__main__":
