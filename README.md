@@ -79,24 +79,6 @@ srt2subtitles
 
 ---
 
-## Environment Variables (Optional)
-
-If you prefer an `.env` file (not required by default):
-
-```bash
-OPENAI_API_KEY=your_key_here
-```
-
-Source it manually if needed:
-
-```bash
-source .env
-```
-
-> Note: Whisper runs **locally** — no API key is required unless you extend the script.
-
----
-
 ## Basic Usage
 
 ### Single File
@@ -105,15 +87,34 @@ source .env
 python generate_srt.py video.mp4
 ```
 
+Item outputs to:
+
+```
+output/001/
+```
+
 ### YouTube URL
 
 ```bash
 python generate_srt.py https://youtube.com/watch?v=XXXX
 ```
 
+Item outputs to:
+
+```
+output/001/
+```
+
 ### Batch Mode
 
 Put media files in `input/` and run:
+
+For example
+```
+input/
+├── video.mp4
+├── video2.mp4
+```
 
 ```bash
 python generate_srt.py --batch
@@ -202,30 +203,11 @@ This avoids Final Cut layout drift caused by literal newlines.
 
 ---
 
-## Why This Script Exists
-
-Final Cut Pro is **extremely sensitive** to:
-
-* FPS rounding (23.976 vs 24)
-* Frame duration mismatches
-* Subtitle overlap from fractional drift
-
-This pipeline:
-
-* Detects real FPS
-* Preserves NTSC precision
-* Fixes `frameDuration` post‑generation
-* Keeps pasted subtitles frame‑accurate
-
-Result: **no overlap, no drift, no manual fixes**.
-
----
-
 ## Known Limitations and Author Notes
 
 * Whisper timing is segment‑based (not word‑level unless extended)
 * Captions export to FCPXL. Double click the file and it loads the captions as a seperate project in Final Cut. Copy paste these into your project. It is the closest I've been able to get to a one click solution
-* The captions will be slighty off or may overlap due to an issue with the framerate in the node package.
+* The captions will be slighty off or may overlap due to an issue with the framerate in the node package. Frame rates are fractions, and the node packages forces you to use an estimation which is a roudned number.
 * Assumes Final Cut Pro XML 1.10+ compatibility
 * Requires `srt2fcpxml-cli` (Node)
 
