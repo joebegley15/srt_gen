@@ -1,4 +1,4 @@
-# generate_srt.py — SRT → Final Cut Pro XML Subtitle Pipeline
+# COMMAND LINE FCPXL AND SRT GENERATOR
 
 This repository is a Python script (`generate_srt.py`) that automates subtitle creation for Final Cut Pro.
 
