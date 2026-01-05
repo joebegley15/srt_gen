@@ -2,13 +2,16 @@
 
 This repository is a Python script (`generate_srt.py`) that automates subtitle creation for Final Cut Pro.
 
-It can:
-* Download or ingest media (local file or YouTube URL)
-* Transcribe audio with OpenAI Whisper
-* Generate SRT subtitles
-* Convert SRT → FCPXML via `srt2subtitles`, a node package
+It does the following in order:
+* Downloads or ingests media (local file or YouTube URL)
+* Transcribes audio with OpenAI Whisper
+* Generates SRT subtitles
+* Converts SRT → FCPXML via `srt2subtitles`, a node package
 
-The output is a **drop‑in Final Cut Pro subtitle generator** designed for clips
+It then generates the following output:
+* A working an importable FCPXML file (note: you will have to load the file, and then drop the subtitles onto your clips)
+* An SRT file
+* A framerate file
 
 ---
 
