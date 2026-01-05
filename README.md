@@ -14,13 +14,13 @@ The output is a **drop‑in Final Cut Pro subtitle generator** designed for clip
 
 ## Features
 
-* ✅ Local files **or** YouTube URLs
-* ✅ Use batch mode to do multiple files at a time (just put all your files in the /input folder and run --batch)
-* ✅ Cadence‑aware subtitle chunking
-* ✅ FPS detection with ffprobe
-* ✅ Post‑generation FCPXML fixes
-* ✅ Optional XML line wrapping (`&#10;`)
-* ✅ Font, size, position, and **line spacing** control
+* Local files **or** YouTube URLs
+* Use batch mode to do multiple files at a time (just put all your files in the /input folder and run --batch)
+* Cadence‑aware subtitle chunking
+* FPS detection with ffprobe
+* Post‑generation FCPXML fixes
+* Optional XML line wrapping (`&#10;`)
+* Font, size, position, and **line spacing** control
 
 ---
 
