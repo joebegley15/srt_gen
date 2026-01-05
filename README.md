@@ -1,27 +1,24 @@
 # generate_srt.py — SRT → Final Cut Pro XML Subtitle Pipeline
 
-This repository contains a single, self‑contained Python script (`generate_srt.py`) that automates **end‑to‑end subtitle creation for Final Cut Pro**:
+This repository is a Python script (`generate_srt.py`) that automates subtitle creation for Final Cut Pro.
 
+It can:
 * Download or ingest media (local file or YouTube URL)
 * Transcribe audio with OpenAI Whisper
 * Generate SRT subtitles
-* Convert SRT → FCPXML via `srt2subtitles`
-* Fix common Final Cut timing issues (FPS drift, frameDuration mismatches)
-* Post‑process FCPXML (font, size, position, line spacing, line breaks)
+* Convert SRT → FCPXML via `srt2subtitles`, a node package
 
-The output is a **drop‑in Final Cut Pro subtitle generator** designed for short‑form content, podcasts, stand‑up clips, and social video.
+The output is a **drop‑in Final Cut Pro subtitle generator** designed for clips
 
 ---
 
 ## Features
 
 * ✅ Local files **or** YouTube URLs
-* ✅ Batch mode for folders
-* ✅ Whisper transcription (GPU if available)
+* ✅ Use batch mode to do multiple files at a time (just put all your files in the /input folder and run --batch)
 * ✅ Cadence‑aware subtitle chunking
 * ✅ FPS detection with ffprobe
 * ✅ Post‑generation FCPXML fixes
-* ✅ Safe NTSC‑style framerate handling
 * ✅ Optional XML line wrapping (`&#10;`)
 * ✅ Font, size, position, and **line spacing** control
 
@@ -48,6 +45,7 @@ brew install ffmpeg node
 ### Python Packages
 
 Create and activate a virtual environment:
+(Within the folder)
 
 ```bash
 python3 -m venv venv
@@ -59,8 +57,6 @@ Install Python dependencies:
 ```bash
 pip install -U torch openai-whisper yt-dlp
 ```
-
-> ⚠️ If you have Apple Silicon, PyTorch will automatically use Metal.
 
 ---
 
@@ -222,9 +218,11 @@ Result: **no overlap, no drift, no manual fixes**.
 
 ---
 
-## Known Limitations
+## Known Limitations and Author Notes
 
 * Whisper timing is segment‑based (not word‑level unless extended)
+* Captions export to FCPXL. Double click the file and it loads the captions as a seperate project in Final Cut. Copy paste these into your project. It is the closest I've been able to get to a one click solution
+* The captions will be slighty off or may overlap due to an issue with the framerate in the node package.
 * Assumes Final Cut Pro XML 1.10+ compatibility
 * Requires `srt2fcpxml-cli` (Node)
 
@@ -232,13 +230,10 @@ Result: **no overlap, no drift, no manual fixes**.
 
 ## License
 
-MIT — do whatever you want. If this saves you time, that’s the win.
+MIT — go for it.
+JOE BEGLEY
+
 
 ---
 
-## Author Notes
-
-This script is intentionally **single‑file** and **hackable**.
-It is meant to be edited, extended, and abused.
-
-If Final Cut breaks something new — this is where you fix it.
+Final Cut can natively generate SRT, but they are non-editable. This is my AI version of a workaround.
