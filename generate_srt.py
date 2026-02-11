@@ -18,6 +18,25 @@ Then (for each media item):
 Cadence option:
   • --cadence: splits long Whisper segments into more natural subtitle chunks.
     - Otherwise punctuation + max-words/max-chars splitting.
+
+NEW FLAGS
+  • --ytmp3
+      - For YouTube URLs, download audio-only as MP3 instead of video.
+
+  • --timestamp "HH:MM:SS-HH:MM:SS"
+      - For YouTube URLs, attempt to download only that segment.
+        If yt-dlp/ffmpeg fails, falls back to downloading and trimming locally.
+      - For local media, trims with ffmpeg before transcription.
+
+  • --cookies <path>
+      - Pass a Netscape cookies.txt file to yt-dlp.
+
+  • --cookies-from-browser "chrome[:PROFILE]" (or "firefox[:PROFILE]")
+      - Let yt-dlp read cookies directly from your browser profile.
+
+  • --remote-ejs
+      - Enables yt-dlp remote EJS challenge solver distribution (ejs:github),
+        which can help with YouTube JS challenges.
 """
 
 import argparse
@@ -40,31 +59,272 @@ def check_ffmpeg():
         sys.exit(1)
 
 # -----------------------------
+# Timestamp parsing
+# -----------------------------
+_HMS_RE = re.compile(r"^\d{2}:\d{2}:\d{2}$")
+_TS_RE = re.compile(r"^\d{2}:\d{2}:\d{2}-\d{2}:\d{2}:\d{2}$")
+
+def _hms_to_seconds(hms: str) -> int:
+    if not _HMS_RE.match(hms):
+        raise ValueError(f"Invalid timecode: {hms}")
+    hh, mm, ss = hms.split(":")
+    return int(hh) * 3600 + int(mm) * 60 + int(ss)
+
+def parse_timestamp_range(ts: str):
+    """
+    Parse "HH:MM:SS-HH:MM:SS"
+    Returns (start_hms, end_hms, start_seconds, end_seconds) or None.
+    """
+    if not ts:
+        return None
+    ts = ts.strip()
+    if not _TS_RE.match(ts):
+        raise ValueError('Invalid --timestamp format. Expected "HH:MM:SS-HH:MM:SS".')
+    start_hms, end_hms = ts.split("-", 1)
+    start_s = _hms_to_seconds(start_hms)
+    end_s = _hms_to_seconds(end_hms)
+    if end_s <= start_s:
+        raise ValueError("--timestamp end must be after start.")
+    return start_hms, end_hms, float(start_s), float(end_s)
+
+# -----------------------------
+# Local trim helper (ffmpeg)
+# -----------------------------
+def trim_media_ffmpeg(in_path: str, out_path: str, start_hms: str, end_hms: str) -> bool:
+    """
+    Trim media using ffmpeg.
+    Try stream copy first; if it fails, fall back to re-encode.
+    """
+    cmd_copy = [
+        "ffmpeg", "-y",
+        "-ss", start_hms,
+        "-to", end_hms,
+        "-i", in_path,
+        "-c", "copy",
+        "-avoid_negative_ts", "make_zero",
+        out_path
+    ]
+    try:
+        subprocess.check_output(cmd_copy, stderr=subprocess.STDOUT)
+        return True
+    except subprocess.CalledProcessError:
+        cmd_re = [
+            "ffmpeg", "-y",
+            "-ss", start_hms,
+            "-to", end_hms,
+            "-i", in_path,
+            "-c:v", "libx264",
+            "-crf", "18",
+            "-preset", "medium",
+            "-c:a", "aac",
+            "-b:a", "192k",
+            "-movflags", "+faststart",
+            out_path
+        ]
+        try:
+            subprocess.check_output(cmd_re, stderr=subprocess.STDOUT)
+            return True
+        except subprocess.CalledProcessError as e2:
+            print("Error trimming media with ffmpeg:\n", e2.output.decode(errors="replace"))
+            return False
+
+def trim_audio_ffmpeg(in_path: str, out_path: str, start_hms: str, end_hms: str) -> bool:
+    """
+    Trim audio to mp3 using ffmpeg.
+    """
+    cmd = [
+        "ffmpeg", "-y",
+        "-ss", start_hms,
+        "-to", end_hms,
+        "-i", in_path,
+        "-vn",
+        "-c:a", "libmp3lame",
+        "-b:a", "192k",
+        out_path
+    ]
+    try:
+        subprocess.check_output(cmd, stderr=subprocess.STDOUT)
+        return True
+    except subprocess.CalledProcessError as e:
+        print("Error trimming audio with ffmpeg:\n", e.output.decode(errors="replace"))
+        return False
+
+# -----------------------------
 # Detect YouTube
 # -----------------------------
 def is_youtube_url(s: str) -> bool:
     return "youtube.com" in s or "youtu.be" in s
 
-def download_youtube(url: str, download_dir: str = "temp_dl"):
+def _auto_js_runtimes_dict():
+    """
+    yt-dlp may need a JS runtime to extract some formats.
+    Newer yt-dlp expects js_runtimes as: {runtime: {config}}
+    """
+    runtimes = []
+    for rt in ("node", "deno", "bun", "quickjs"):
+        if shutil.which(rt):
+            runtimes.append(rt)
+    return {rt: {} for rt in runtimes} if runtimes else None
+
+def _newest_in_dir(download_dir: str, exts):
+    p = Path(download_dir)
+    files = []
+    for ext in exts:
+        files.extend(p.glob(f"*{ext}"))
+    files = sorted(files, key=lambda x: x.stat().st_mtime, reverse=True)
+    return str(files[0]) if files else None
+
+def _parse_cookies_from_browser_arg(s: str):
+    """
+    Accepts:
+      chrome
+      chrome:Profile 1
+      firefox
+      firefox:default-release
+    Returns tuple for yt-dlp "cookiesfrombrowser".
+    """
+    if not s:
+        return None
+    s = s.strip()
+    if ":" in s:
+        browser, profile = s.split(":", 1)
+        browser = browser.strip()
+        profile = profile.strip()
+        if not browser:
+            return None
+        if profile:
+            return (browser, profile)
+        return (browser,)
+    return (s,)
+
+def download_youtube(
+    url: str,
+    download_dir: str = "temp_dl",
+    ytmp3: bool = False,
+    timestamp_range=None,            # (start_hms, end_hms, start_s, end_s) or None
+    cookies_file: str | None = None,
+    cookies_from_browser: str | None = None,
+    remote_ejs: bool = False,
+):
+    """
+    YouTube download.
+
+    Segment behavior:
+      - If --timestamp is provided, we attempt yt-dlp ranged download first.
+      - If that fails, we fall back to download then local trim.
+
+    Note:
+      - If YouTube returns "Sign in to confirm you're not a bot", you must use
+        --cookies or --cookies-from-browser for authenticated cookie access.
+    """
     try:
         from yt_dlp import YoutubeDL
+        from yt_dlp.utils import download_range_func
     except ImportError:
         sys.stderr.write("Error: yt-dlp not installed. Run: pip install yt-dlp\n")
         sys.exit(1)
 
     os.makedirs(download_dir, exist_ok=True)
-    ydl_opts = {
-        "format": "mp4/best",
-        "outtmpl": os.path.join(download_dir, "video.%(ext)s"),
-        "quiet": True,
-    }
 
-    print(f"Downloading YouTube video: {url}")
-    with YoutubeDL(ydl_opts) as ydl:
+    def _ydl_opts(for_range: bool):
+        opts = {
+            "quiet": True,
+            "noplaylist": True,
+            "retries": 10,
+            "fragment_retries": 10,
+            "outtmpl": os.path.join(download_dir, ("audio.%(ext)s" if ytmp3 else "video.%(ext)s")),
+            "hls_prefer_native": True,
+            "concurrent_fragment_downloads": 1,
+        }
+
+        js_runtimes = _auto_js_runtimes_dict()
+        if js_runtimes:
+            opts["js_runtimes"] = js_runtimes
+
+        if remote_ejs:
+            # matches CLI: --remote-components ejs:github
+            opts["remote_components"] = ["ejs:github"]
+
+        if cookies_file:
+            opts["cookiefile"] = cookies_file
+
+        if cookies_from_browser:
+            cfb = _parse_cookies_from_browser_arg(cookies_from_browser)
+            if cfb:
+                opts["cookiesfrombrowser"] = cfb
+
+        # Avoid android client (can require PO token); stick to web-ish clients.
+        opts["extractor_args"] = {"youtube": {"player_client": ["tv", "web"]}}
+
+        if for_range and timestamp_range:
+            _, _, start_s, end_s = timestamp_range
+            opts["download_ranges"] = download_range_func(None, [(start_s, end_s)])
+
+        if ytmp3:
+            opts["format"] = "bestaudio/best"
+            opts["postprocessors"] = [
+                {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}
+            ]
+        else:
+            opts["format"] = "mp4/best"
+
+        return opts
+
+    start_hms = end_hms = None
+    if timestamp_range:
+        start_hms, end_hms, _, _ = timestamp_range
+
+    print(f"Downloading YouTube {'audio (mp3)' if ytmp3 else 'video'}: {url}")
+
+    # 1) Try ranged download first (if requested)
+    if timestamp_range:
+        try:
+            with YoutubeDL(_ydl_opts(for_range=True)) as ydl:
+                info = ydl.extract_info(url, download=True)
+                filename = ydl.prepare_filename(info)
+
+            if ytmp3:
+                mp3 = _newest_in_dir(download_dir, [".mp3"])
+                if mp3:
+                    return mp3
+            return filename
+
+        except Exception as e:
+            print(f"⚠ Ranged YouTube download failed ({e}). Falling back to download + local trim.")
+
+    # 2) Fallback full download
+    with YoutubeDL(_ydl_opts(for_range=False)) as ydl:
         info = ydl.extract_info(url, download=True)
         filename = ydl.prepare_filename(info)
 
-    return filename
+    # Find actual output after post-processing/merging
+    if ytmp3:
+        mp3 = _newest_in_dir(download_dir, [".mp3"])
+        if not mp3:
+            mp3 = _newest_in_dir(download_dir, [".m4a", ".webm", ".aac", ".opus"])
+        if not mp3:
+            return filename
+
+        if timestamp_range:
+            clipped = os.path.join(download_dir, "audio_clip.mp3")
+            ok = trim_audio_ffmpeg(mp3, clipped, start_hms, end_hms)
+            return clipped if ok else mp3
+
+        return mp3
+
+    # video fallback trim
+    src = filename
+    if not os.path.isfile(src):
+        src = _newest_in_dir(download_dir, [".mp4", ".mkv", ".webm"])
+        if not src:
+            return filename
+
+    if timestamp_range:
+        clipped = os.path.join(download_dir, "video_clip.mp4")
+        ok = trim_media_ffmpeg(src, clipped, start_hms, end_hms)
+        return clipped if ok else src
+
+    return src
 
 # -----------------------------
 # Auto-increment output folder
@@ -269,15 +529,9 @@ def run_node_srt2subtitles(srt_path: str, fps: float):
 # -----------------------------
 # Line-break helper for FCPXML text nodes
 # -----------------------------
-# We cannot force ElementTree to emit '&#10;' for newlines inside text nodes.
-# So we insert a unique placeholder token and do a file-level replacement to '&#10;'.
 _LB_TOKEN = "__FCPXML_LINEBREAK__"
 
 def _wrap_text_word_boundary_to_token(s: str, max_chars: int) -> str:
-    """
-    Wrap lines at word boundaries, inserting _LB_TOKEN between lines.
-    (Later replaced in the saved XML with '&#10;'.)
-    """
     if not s or max_chars is None or max_chars <= 0:
         return s
 
@@ -311,14 +565,6 @@ def _wrap_text_word_boundary_to_token(s: str, max_chars: int) -> str:
     return _LB_TOKEN.join([x for x in out_lines if x != ""])
 
 def apply_fcpxml_line_breaks_entity(fcpx_path: str, line_break_chars: int) -> bool:
-    """
-    Wrap text nodes by inserting '&#10;' line breaks.
-    Implementation:
-      1) Replace text with placeholder token between wrapped lines
-      2) Save XML
-      3) Replace placeholder token in the file with '&#10;'
-    Returns True if any changes were made.
-    """
     if not os.path.exists(fcpx_path):
         print("⚠ Could not apply line breaks: file missing:", fcpx_path)
         return False
@@ -380,7 +626,6 @@ def modify_fcpxml(
             if elem.attrib.get("name") == "Position":
                 elem.set("value", position)
 
-        # Add lineSpacing right where you modify font (same element set)
         if font and "font" in elem.attrib:
             elem.set("font", font)
             if line_spacing is not None:
@@ -428,14 +673,38 @@ def process_one(
     max_chars=42,
     max_duration=2.6,
     line_break_chars=None,
+    ytmp3=False,
+    timestamp=None,
+    cookies_file=None,
+    cookies_from_browser=None,
+    remote_ejs=False,
 ):
+    ts = parse_timestamp_range(timestamp) if timestamp else None
+
     if is_youtube_url(input_path):
-        input_file = download_youtube(input_path)
+        input_file = download_youtube(
+            input_path,
+            ytmp3=ytmp3,
+            timestamp_range=ts,
+            cookies_file=cookies_file,
+            cookies_from_browser=cookies_from_browser,
+            remote_ejs=remote_ejs,
+        )
     else:
         if not os.path.isfile(input_path):
             print(f"Error: input file not found: {input_path}")
             return
         input_file = input_path
+
+        if ts:
+            start_hms, end_hms = ts[0], ts[1]
+            base = os.path.basename(input_path)
+            tmp_trim = os.path.join(os.getcwd(), f"__clip__{base}")
+            ok = trim_media_ffmpeg(input_path, tmp_trim, start_hms, end_hms)
+            if not ok:
+                print("⚠ Trim failed; skipping.")
+                return
+            input_file = tmp_trim
 
     out_folder = next_output_folder()
 
@@ -517,7 +786,6 @@ def main():
     parser.add_argument("--font", type=str, help='Font family, e.g. "Helvetica"')
     parser.add_argument("--fontsize", type=int, help="Font size in pixels")
 
-    # NEW: line spacing (can be negative)
     parser.add_argument(
         "--line-spacing",
         dest="line_spacing",
@@ -539,6 +807,39 @@ def main():
         help="If set, insert '&#10;' in FCPXML text nodes when text exceeds this many characters (word-boundary wrap).",
     )
 
+    parser.add_argument(
+        "--ytmp3",
+        action="store_true",
+        help="For YouTube URLs, download audio-only as MP3 instead of video.",
+    )
+
+    parser.add_argument(
+        "--timestamp",
+        type=str,
+        default=None,
+        help='Restrict processing to this time window. Format: "HH:MM:SS-HH:MM:SS"',
+    )
+
+    # NEW: cookies support (required for many 'confirm you are not a bot' cases)
+    parser.add_argument(
+        "--cookies",
+        type=str,
+        default=None,
+        help="Path to a Netscape cookies.txt file for yt-dlp.",
+    )
+    parser.add_argument(
+        "--cookies-from-browser",
+        dest="cookies_from_browser",
+        type=str,
+        default=None,
+        help='Read cookies from browser. Example: "chrome" or "chrome:Profile 1" or "firefox:default-release".',
+    )
+    parser.add_argument(
+        "--remote-ejs",
+        action="store_true",
+        help="Enable yt-dlp remote EJS challenge solver distribution (ejs:github).",
+    )
+
     args = parser.parse_args()
     check_ffmpeg()
 
@@ -557,6 +858,11 @@ def main():
                 max_chars=args.max_chars,
                 max_duration=args.max_duration,
                 line_break_chars=args.lb_chars,
+                ytmp3=False,
+                timestamp=args.timestamp,
+                cookies_file=args.cookies,
+                cookies_from_browser=args.cookies_from_browser,
+                remote_ejs=args.remote_ejs,
             )
         if not any_found:
             print(f"⚠ No media files found in: {args.input_dir}")
@@ -577,6 +883,11 @@ def main():
         max_chars=args.max_chars,
         max_duration=args.max_duration,
         line_break_chars=args.lb_chars,
+        ytmp3=args.ytmp3,
+        timestamp=args.timestamp,
+        cookies_file=args.cookies,
+        cookies_from_browser=args.cookies_from_browser,
+        remote_ejs=args.remote_ejs,
     )
 
 if __name__ == "__main__":
