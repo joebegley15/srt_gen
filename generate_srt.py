@@ -152,179 +152,11 @@ def trim_audio_ffmpeg(in_path: str, out_path: str, start_hms: str, end_hms: str)
 # -----------------------------
 # Detect YouTube
 # -----------------------------
-def is_youtube_url(s: str) -> bool:
-    return "youtube.com" in s or "youtu.be" in s
 
-def _auto_js_runtimes_dict():
-    """
-    yt-dlp may need a JS runtime to extract some formats.
-    Newer yt-dlp expects js_runtimes as: {runtime: {config}}
-    """
-    runtimes = []
-    for rt in ("node", "deno", "bun", "quickjs"):
-        if shutil.which(rt):
-            runtimes.append(rt)
-    return {rt: {} for rt in runtimes} if runtimes else None
-
-def _newest_in_dir(download_dir: str, exts):
-    p = Path(download_dir)
-    files = []
-    for ext in exts:
-        files.extend(p.glob(f"*{ext}"))
-    files = sorted(files, key=lambda x: x.stat().st_mtime, reverse=True)
-    return str(files[0]) if files else None
-
-def _parse_cookies_from_browser_arg(s: str):
-    """
-    Accepts:
-      chrome
-      chrome:Profile 1
-      firefox
-      firefox:default-release
-    Returns tuple for yt-dlp "cookiesfrombrowser".
-    """
-    if not s:
-        return None
-    s = s.strip()
-    if ":" in s:
-        browser, profile = s.split(":", 1)
-        browser = browser.strip()
-        profile = profile.strip()
-        if not browser:
-            return None
-        if profile:
-            return (browser, profile)
-        return (browser,)
-    return (s,)
-
-def download_youtube(
-    url: str,
-    download_dir: str = "temp_dl",
-    ytmp3: bool = False,
-    timestamp_range=None,            # (start_hms, end_hms, start_s, end_s) or None
-    cookies_file: str | None = None,
-    cookies_from_browser: str | None = None,
-    remote_ejs: bool = False,
-):
-    """
-    YouTube download.
-
-    Segment behavior:
-      - If --timestamp is provided, we attempt yt-dlp ranged download first.
-      - If that fails, we fall back to download then local trim.
-
-    Note:
-      - If YouTube returns "Sign in to confirm you're not a bot", you must use
-        --cookies or --cookies-from-browser for authenticated cookie access.
-    """
-    try:
-        from yt_dlp import YoutubeDL
-        from yt_dlp.utils import download_range_func
-    except ImportError:
-        sys.stderr.write("Error: yt-dlp not installed. Run: pip install yt-dlp\n")
-        sys.exit(1)
-
-    os.makedirs(download_dir, exist_ok=True)
-
-    def _ydl_opts(for_range: bool):
-        opts = {
-            "quiet": True,
-            "noplaylist": True,
-            "retries": 10,
-            "fragment_retries": 10,
-            "outtmpl": os.path.join(download_dir, ("audio.%(ext)s" if ytmp3 else "video.%(ext)s")),
-            "hls_prefer_native": True,
-            "concurrent_fragment_downloads": 1,
-        }
-
-        js_runtimes = _auto_js_runtimes_dict()
-        if js_runtimes:
-            opts["js_runtimes"] = js_runtimes
-
-        if remote_ejs:
-            # matches CLI: --remote-components ejs:github
-            opts["remote_components"] = ["ejs:github"]
-
-        if cookies_file:
-            opts["cookiefile"] = cookies_file
-
-        if cookies_from_browser:
-            cfb = _parse_cookies_from_browser_arg(cookies_from_browser)
-            if cfb:
-                opts["cookiesfrombrowser"] = cfb
-
-        # Avoid android client (can require PO token); stick to web-ish clients.
-        opts["extractor_args"] = {"youtube": {"player_client": ["tv", "web"]}}
-
-        if for_range and timestamp_range:
-            _, _, start_s, end_s = timestamp_range
-            opts["download_ranges"] = download_range_func(None, [(start_s, end_s)])
-
-        if ytmp3:
-            opts["format"] = "bestaudio/best"
-            opts["postprocessors"] = [
-                {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}
-            ]
-        else:
-            opts["format"] = "mp4/best"
-
-        return opts
-
-    start_hms = end_hms = None
-    if timestamp_range:
-        start_hms, end_hms, _, _ = timestamp_range
-
-    print(f"Downloading YouTube {'audio (mp3)' if ytmp3 else 'video'}: {url}")
-
-    # 1) Try ranged download first (if requested)
-    if timestamp_range:
-        try:
-            with YoutubeDL(_ydl_opts(for_range=True)) as ydl:
-                info = ydl.extract_info(url, download=True)
-                filename = ydl.prepare_filename(info)
-
-            if ytmp3:
-                mp3 = _newest_in_dir(download_dir, [".mp3"])
-                if mp3:
-                    return mp3
-            return filename
-
-        except Exception as e:
-            print(f"⚠ Ranged YouTube download failed ({e}). Falling back to download + local trim.")
-
-    # 2) Fallback full download
-    with YoutubeDL(_ydl_opts(for_range=False)) as ydl:
-        info = ydl.extract_info(url, download=True)
-        filename = ydl.prepare_filename(info)
-
-    # Find actual output after post-processing/merging
-    if ytmp3:
-        mp3 = _newest_in_dir(download_dir, [".mp3"])
-        if not mp3:
-            mp3 = _newest_in_dir(download_dir, [".m4a", ".webm", ".aac", ".opus"])
-        if not mp3:
-            return filename
-
-        if timestamp_range:
-            clipped = os.path.join(download_dir, "audio_clip.mp3")
-            ok = trim_audio_ffmpeg(mp3, clipped, start_hms, end_hms)
-            return clipped if ok else mp3
-
-        return mp3
-
-    # video fallback trim
-    src = filename
-    if not os.path.isfile(src):
-        src = _newest_in_dir(download_dir, [".mp4", ".mkv", ".webm"])
-        if not src:
-            return filename
-
-    if timestamp_range:
-        clipped = os.path.join(download_dir, "video_clip.mp4")
-        ok = trim_media_ffmpeg(src, clipped, start_hms, end_hms)
-        return clipped if ok else src
-
-    return src
+# -----------------------------
+# YouTube download logic lives in youtube_download.py
+# -----------------------------
+from youtube_download import is_youtube_url, download_youtube
 
 # -----------------------------
 # Auto-increment output folder
@@ -682,7 +514,7 @@ def process_one(
     ts = parse_timestamp_range(timestamp) if timestamp else None
 
     if is_youtube_url(input_path):
-        input_file = download_youtube(
+        dl = download_youtube(
             input_path,
             ytmp3=ytmp3,
             timestamp_range=ts,
@@ -690,6 +522,22 @@ def process_one(
             cookies_from_browser=cookies_from_browser,
             remote_ejs=remote_ejs,
         )
+        input_file = dl["path"]
+
+        # Guarantee timestamps still work: if ranged download failed, trim locally.
+        if ts and not dl.get("was_ranged"):
+            start_hms, end_hms = ts[0], ts[1]
+            if ytmp3:
+                clipped = os.path.join(os.getcwd(), "__clip__audio.mp3")
+                ok = trim_audio_ffmpeg(input_file, clipped, start_hms, end_hms)
+            else:
+                clipped = os.path.join(os.getcwd(), "__clip__video.mp4")
+                ok = trim_media_ffmpeg(input_file, clipped, start_hms, end_hms)
+
+            if ok:
+                input_file = clipped
+            else:
+                print("⚠ Local trim failed; continuing with full download.")
     else:
         if not os.path.isfile(input_path):
             print(f"Error: input file not found: {input_path}")
