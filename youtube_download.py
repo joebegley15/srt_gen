@@ -181,7 +181,11 @@ def download_youtube(
             opts["download_ranges"] = download_range_func(None, [(start_s, end_s)])
 
         if ytmp3:
-            opts["format"] = "bestaudio/best"
+            opts["format"] = (
+                "bestvideo[ext=mp4]+bestaudio[ext=m4a]/"
+                "bestvideo+bestaudio/"
+                "best"
+            )
             opts["postprocessors"] = [
                 {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}
             ]
