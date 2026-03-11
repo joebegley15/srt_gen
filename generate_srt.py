@@ -291,7 +291,7 @@ def sentence_chunk_segments(
 
             if is_sentence_end:
                 flush()
-            elif is_soft_break and too_long:
+            elif is_soft_break:
                 flush()
             elif too_long:
                 flush()
