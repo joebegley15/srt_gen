@@ -50,6 +50,14 @@ from datetime import timedelta
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
+try:
+    import tomllib          # Python 3.11+
+except ImportError:
+    try:
+        import tomli as tomllib   # pip install tomli
+    except ImportError:
+        tomllib = None
+
 from youtube_download import is_youtube_url, download_youtube
 
 # -----------------------------
@@ -220,14 +228,15 @@ def _count_real_words(words) -> int:
 
 def sentence_chunk_segments(
     segments,
-    max_words=12,
-    max_chars=70,
-    max_duration=4.0,
+    max_words=18,
+    max_chars=100,
+    max_duration=6.5,
 ):
     """
     Build subtitle chunks using Whisper word timestamps.
-    Prefer breaking on sentence endings (. ! ?), then commas/pauses,
-    then hard length limits.
+    Prioritize natural punctuation boundaries for readability and accuracy.
+    Break first on sentence endings (. ! ?), then commas / soft pauses.
+    Only fall back to hard limits if a clause runs unusually long.
     """
     out = []
 
@@ -293,7 +302,7 @@ def sentence_chunk_segments(
                 flush()
             elif is_soft_break:
                 flush()
-            elif too_long:
+            elif too_long and (word_count >= max_words or duration >= max_duration or len(text_now) >= max_chars):
                 flush()
 
         flush()
@@ -606,11 +615,11 @@ def resolve_style_defaults(style: str, max_words, max_chars, max_duration):
             max_duration = 2.6
     else:
         if max_words is None:
-            max_words = 12
+            max_words = 18
         if max_chars is None:
-            max_chars = 70
+            max_chars = 100
         if max_duration is None:
-            max_duration = 4.0
+            max_duration = 6.5
     return max_words, max_chars, max_duration
 
 # -----------------------------
@@ -700,14 +709,17 @@ def process_one(
     import whisper
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = whisper.load_model("base", device=device)
+    model = whisper.load_model("large", device=device)
 
-    print("Transcribing...")
+    print("Transcribing with Whisper large for maximum accuracy...")
     result = model.transcribe(
         input_file,
         verbose=False,
         word_timestamps=True,
         condition_on_previous_text=True,
+        temperature=0,
+        beam_size=5,
+        best_of=5,
     )
 
     raw_segments = result.get("segments", [])
@@ -760,64 +772,113 @@ def process_one(
     )
 
 # -----------------------------
+# Config file loader
+# -----------------------------
+CONFIG_FILENAME = "config.toml"
+
+def load_config(path: str = CONFIG_FILENAME) -> dict:
+    """
+    Load config.toml from the same directory as this script (or cwd).
+    Returns an empty dict if the file is missing or tomllib is unavailable.
+    """
+    if tomllib is None:
+        return {}
+
+    candidates = [
+        Path(path),
+        Path(__file__).parent / path,
+    ]
+    for p in candidates:
+        if p.exists():
+            with open(p, "rb") as f:
+                cfg = tomllib.load(f)
+            print(f"Loaded config: {p}")
+            return cfg
+
+    return {}
+
+
+def _cfg(cfg: dict, *keys, default=None):
+    """Safely walk nested config keys: _cfg(cfg, 'fcpxml', 'font')"""
+    node = cfg
+    for k in keys:
+        if not isinstance(node, dict):
+            return default
+        node = node.get(k, None)
+        if node is None:
+            return default
+    return node
+
+
+# -----------------------------
 # Main program
 # -----------------------------
 def main():
+    cfg = load_config()
+
     parser = argparse.ArgumentParser(
         description="Generate SRT + FCPXML for one input or a whole directory."
     )
 
     parser.add_argument("input", nargs="?", help="Local media file OR YouTube URL")
     parser.add_argument("--batch", action="store_true", help='Process all media files in --input-dir')
-    parser.add_argument("--input-dir", default="input", help='Directory to scan in batch mode')
+    parser.add_argument(
+        "--input-dir",
+        default=_cfg(cfg, "batch", "input_dir", default="input"),
+        help='Directory to scan in batch mode',
+    )
 
-    parser.add_argument("--position", type=str, help='Position "X Y", for example "0 -300"')
-    parser.add_argument("--font", type=str, help='Font family, for example "Helvetica"')
-    parser.add_argument("--fontsize", type=int, help="Font size in pixels")
+    parser.add_argument("--position", type=str, default=_cfg(cfg, "fcpxml", "position"),
+                        help='Position "X Y", for example "0 -300"')
+    parser.add_argument("--font", type=str, default=_cfg(cfg, "fcpxml", "font"),
+                        help='Font family, for example "Helvetica"')
+    parser.add_argument("--fontsize", type=int, default=_cfg(cfg, "fcpxml", "fontsize"),
+                        help="Font size in pixels")
     parser.add_argument(
         "--line-spacing",
         dest="line_spacing",
         type=int,
-        default=None,
+        default=_cfg(cfg, "fcpxml", "line_spacing"),
         help='Add lineSpacing="N" to FCPXML elements where font is set',
     )
     parser.add_argument(
         "--line-break-chars",
         dest="line_break_chars",
         type=int,
-        default=None,
+        default=_cfg(cfg, "fcpxml", "line_break_chars"),
         help="Insert '&#10;' in FCPXML text nodes when text exceeds this many characters",
     )
 
     parser.add_argument(
         "--style",
         choices=["sentence", "cadence"],
-        default="sentence",
+        default=_cfg(cfg, "style", "default", default="sentence"),
         help="Subtitle style. sentence = smoother/natural, cadence = punchier/short-form",
     )
 
     parser.add_argument(
         "--max-words",
         type=int,
-        default=None,
+        default=_cfg(cfg, "style", "max_words"),
         help="Maximum words per subtitle chunk. Defaults depend on --style",
     )
     parser.add_argument(
         "--max-chars",
         type=int,
-        default=None,
+        default=_cfg(cfg, "style", "max_chars"),
         help="Maximum characters per subtitle chunk. Defaults depend on --style",
     )
     parser.add_argument(
         "--max-duration",
         type=float,
-        default=None,
+        default=_cfg(cfg, "style", "max_duration"),
         help="Maximum seconds per subtitle chunk. Defaults depend on --style",
     )
 
     parser.add_argument(
         "--ytmp3",
         action="store_true",
+        default=_cfg(cfg, "youtube", "ytmp3", default=False),
         help="For YouTube URLs, download audio-only as MP3 instead of video",
     )
     parser.add_argument(
@@ -829,14 +890,14 @@ def main():
     parser.add_argument(
         "--cookies",
         type=str,
-        default=None,
+        default=_cfg(cfg, "youtube", "cookies"),
         help="Path to a Netscape cookies.txt file for yt-dlp",
     )
     parser.add_argument(
         "--cookies-from-browser",
         dest="cookies_from_browser",
         type=str,
-        default=None,
+        default=_cfg(cfg, "youtube", "cookies_from_browser"),
         help='Read cookies from browser. Example: "chrome" or "chrome:Profile 1"',
     )
     parser.add_argument(

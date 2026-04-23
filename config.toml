@@ -1,0 +1,20 @@
+# generate_srt config
+# CLI flags always override these. To ignore a setting, comment it out.
+ 
+[batch]
+input_dir = "input"
+ 
+[style]
+default = "sentence"       # sentence | cadence
+ 
+[fcpxml]
+font             = "Oswald SemiBold"
+position         = "0 -260"
+line_break_chars = 24
+line_spacing     = -16
+# fontsize       = 72      # uncomment to set a default font size
+ 
+[youtube]
+ytmp3              = false
+# cookies_from_browser = "chrome"   # uncomment if you always need cookies
+# cookies            = "cookies.txt"
