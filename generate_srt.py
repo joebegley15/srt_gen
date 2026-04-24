@@ -550,30 +550,69 @@ def cadence_chunk_segments(segments, max_words=7, max_chars=42, max_duration=2.6
 _LB_TOKEN = "__FCPXML_LINEBREAK__"
 
 def _wrap_to_token(s: str, max_chars: int) -> str:
+    """
+    Split a line into balanced chunks where each is <= max_chars.
+    Instead of greedy wrapping, find the split point closest to the midpoint
+    so both lines are as equal in length as possible.
+
+    "this is a sentence with a required split"
+      → "this is a sentence"
+        "with a required split"
+    """
     if not s or max_chars is None or max_chars <= 0:
         return s
+
     out_lines = []
     for line in s.splitlines():
         line = line.strip()
         if len(line) <= max_chars:
             out_lines.append(line)
             continue
+
         words = line.split()
         if not words:
             out_lines.append(line)
             continue
-        cur = words[0]
-        for w in words[1:]:
-            candidate = f"{cur} {w}"
-            if len(candidate) <= max_chars:
-                cur = candidate
-            else:
-                out_lines.append(cur)
-                cur = w
-                while len(cur) > max_chars:
-                    out_lines.append(cur[:max_chars])
-                    cur = cur[max_chars:]
-        out_lines.append(cur)
+
+        # Determine how many lines we need
+        n_lines = math.ceil(len(line) / max_chars)
+        target  = len(line) / n_lines  # target chars per line
+
+        # Build cumulative char positions at each word boundary
+        # positions[i] = length of " ".join(words[:i])
+        positions = [0]
+        for w in words:
+            positions.append(positions[-1] + (1 if positions[-1] > 0 else 0) + len(w))
+
+        # Greedily find the best split point for each line
+        remaining_words = list(words)
+        for line_num in range(n_lines - 1):
+            if not remaining_words:
+                break
+            # How many lines still to fill after this one
+            lines_left = n_lines - line_num
+            total_remaining = sum(len(w) for w in remaining_words) + max(0, len(remaining_words) - 1)
+            ideal_end = total_remaining / lines_left  # ideal chars for this line
+
+            # Find word boundary closest to ideal_end
+            best_split = 1
+            best_dist  = float("inf")
+            cumlen = 0
+            for i, w in enumerate(remaining_words):
+                cumlen += len(w) + (1 if i > 0 else 0)
+                dist = abs(cumlen - ideal_end)
+                if dist < best_dist and cumlen <= max_chars:
+                    best_dist  = dist
+                    best_split = i + 1
+                elif cumlen > max_chars:
+                    break
+
+            out_lines.append(" ".join(remaining_words[:best_split]))
+            remaining_words = remaining_words[best_split:]
+
+        if remaining_words:
+            out_lines.append(" ".join(remaining_words))
+
     return _LB_TOKEN.join(x for x in out_lines if x)
 
 def apply_fcpxml_line_breaks(fcpx_path: str, line_break_chars: int) -> bool:
