@@ -18,8 +18,8 @@ Then (for each media item):
     nodes by inserting XML line-break entity '&#10;' at word boundaries.
 
 Subtitle styles:
-  • sentence  — breaks at sentence endings and natural pauses using
-                Whisper word timestamps. No external API required.
+  • sentence  — punctuation-aware sentence boundaries, each sentence subdivided
+                into equal-sized chunks using exact Whisper word timestamps.
   • cadence   — punchier, shorter chunks for social/short-form usage.
 
 Quality presets (--quality):
@@ -46,7 +46,7 @@ import shutil
 import subprocess
 import sys
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -97,8 +97,8 @@ def _cfg(cfg: dict, *keys, default=None):
 @dataclass
 class SubtitleConfig:
     style: str            = "sentence"
-    quality: str          = "auto"     # auto | high | medium | low
-    min_words: int        = None       # sentence mode: min words before a soft break fires
+    quality: str          = "auto"
+    min_words: int        = None
     max_words: int        = None
     max_chars: int        = None
     max_duration: float   = None
@@ -109,14 +109,14 @@ class SubtitleConfig:
     line_break_chars: int = None
 
     def resolve_defaults(self):
-        """Fill in style-specific defaults for any unset limit fields."""
         if self.style == "cadence":
             self.max_words    = self.max_words    or 7
             self.max_chars    = self.max_chars    or 42
             self.max_duration = self.max_duration or 2.6
         else:
+            # max_chars drives chunk size within each sentence
+            self.max_chars    = self.max_chars    or 40
             self.max_words    = self.max_words    or 18
-            self.max_chars    = self.max_chars    or 120
             self.max_duration = self.max_duration or 8.0
             self.min_words    = self.min_words    or 4
 
@@ -137,9 +137,6 @@ class WhisperPreset:
     best_of: int
     condition_on_previous_text: bool
 
-# high   — large model, full beam search. Best accuracy, slowest.
-# medium — medium model, reduced beam. Good accuracy, ~2-3x faster.
-# low    — small model, greedy decode. Fastest, noticeably lower accuracy.
 QUALITY_PRESETS: dict[str, WhisperPreset] = {
     "high":   WhisperPreset(model="large",  beam_size=5, best_of=5, condition_on_previous_text=True),
     "medium": WhisperPreset(model="medium", beam_size=3, best_of=3, condition_on_previous_text=False),
@@ -162,7 +159,6 @@ def _hms_to_seconds(hms: str) -> int:
     return int(hh) * 3600 + int(mm) * 60 + int(ss)
 
 def parse_timestamp_range(ts: str):
-    """Parse 'HH:MM:SS-HH:MM:SS' → (start_hms, end_hms, start_s, end_s) or None."""
     if not ts:
         return None
     ts = ts.strip()
@@ -193,16 +189,7 @@ def _run_ffmpeg(cmd: list, loud: bool = False) -> bool:
             print("Error running ffmpeg:\n", e.output.decode(errors="replace"))
         return False
 
-def trim_with_ffmpeg(
-    in_path: str, out_path: str,
-    start_hms: str, end_hms: str,
-    audio_only: bool = False,
-) -> bool:
-    """
-    Trim media with ffmpeg.
-    audio_only=True  → re-encode to mp3 directly.
-    audio_only=False → try stream copy first, fall back to h264/aac re-encode.
-    """
+def trim_with_ffmpeg(in_path, out_path, start_hms, end_hms, audio_only=False):
     base = ["ffmpeg", "-y", "-ss", start_hms, "-to", end_hms, "-i", in_path]
     if audio_only:
         return _run_ffmpeg(base + ["-vn", "-c:a", "libmp3lame", "-b:a", "192k", out_path], loud=True)
@@ -227,7 +214,6 @@ def detect_fps(video_path: str) -> float:
         return 24.0
 
 def get_duration(media_path: str) -> float:
-    """Return media duration in seconds, or 0.0 on failure."""
     try:
         raw = subprocess.check_output([
             "ffprobe", "-v", "0", "-of", "csv=p=0",
@@ -264,38 +250,26 @@ def format_timestamp(seconds: float) -> str:
     mm, ss  = divmod(rem, 60)
     return f"{hh:02d}:{mm:02d}:{ss:02d},{ms:03d}"
 
-def write_srt(all_words: list, out_path: str):
-    """Write one SRT entry per word using Whisper word-level timestamps."""
+def write_srt(segments: list, out_path: str):
+    """Write SRT from a list of {start, end, text} dicts."""
     with open(out_path, "w", encoding="utf-8") as f:
-        i = 1
-        for w in all_words:
-            text = _word_text(w).strip()
-            if not text:
-                continue
-            start = float(w.get("start", 0.0))
-            end   = float(w.get("end",   0.0))
-            if end <= start:
-                end = start + 0.1
-            f.write(
-                f"{i}\n"
-                f"{format_timestamp(start)} --> {format_timestamp(end)}\n"
-                f"{text}\n\n"
-            )
-            i += 1
-
-
-def write_sentences_srt(segments: list, out_path: str):
-    """Write a sentence-level SRT for srt2subtitles to consume."""
-    with open(out_path, "w", encoding="utf-8") as f:
-        for i, seg in enumerate(segments, start=1):
+        idx = 1
+        for seg in segments:
             text = seg.get("text", "").strip()
             if not text:
                 continue
-            f.write(
-                f"{i}\n"
-                f"{format_timestamp(seg.get('start', 0.0))} --> {format_timestamp(seg.get('end', 0.0))}\n"
-                f"{text}\n\n"
-            )
+            start = float(seg.get("start", 0.0))
+            end   = float(seg.get("end",   0.0))
+            if end <= start:
+                end = start + 0.1
+            f.write(f"{idx}\n{format_timestamp(start)} --> {format_timestamp(end)}\n{text}\n\n")
+            idx += 1
+
+def write_words_srt(all_words: list, out_path: str):
+    """Write one SRT entry per word using Whisper word-level timestamps."""
+    word_segs = [{"start": w.get("start", 0.0), "end": w.get("end", 0.0), "text": _word_text(w).strip()}
+                 for w in all_words if _word_text(w).strip()]
+    write_srt(word_segs, out_path)
 
 
 # ---------------------------------------------------------------------------
@@ -311,7 +285,6 @@ def _count_real_words(words: list) -> int:
     return sum(1 for w in words if _word_text(w).strip())
 
 def _flatten_words(segments: list) -> list:
-    """Extract all word-level dicts from Whisper segments into a flat list."""
     all_words = []
     for seg in segments:
         words = seg.get("words") or []
@@ -328,18 +301,10 @@ def _flatten_words(segments: list) -> list:
     return all_words
 
 
-
 # ---------------------------------------------------------------------------
 # Punctuation restoration (local, no API)
 # ---------------------------------------------------------------------------
 def _restore_punctuation(all_words: list) -> list:
-    """
-    Run deepmultilingualpunctuation on the flat word list to restore
-    commas, periods, question marks etc. Returns a new word list with
-    the same timestamps but punctuated text.
-
-    Falls back to the original word list if the model isn't installed.
-    """
     try:
         from deepmultilingualpunctuation import PunctuationModel
     except ImportError:
@@ -355,25 +320,19 @@ def _restore_punctuation(all_words: list) -> list:
         model  = PunctuationModel()
         result = model.restore_punctuation(raw_text)
     except TypeError:
-        # Older deepmultilingualpunctuation uses grouped_entities which was removed
-        # in newer transformers. Patch it in place.
         from transformers import pipeline as hf_pipeline
         import deepmultilingualpunctuation.punctuationmodel as _pm
         _pm.pipeline = lambda task, model, **kw: hf_pipeline(task, model, aggregation_strategy="none")
         model  = PunctuationModel()
         result = model.restore_punctuation(raw_text)
 
-    # model returns a string — split back into tokens and re-attach timestamps
     punct_tokens = result.split()
     orig_tokens  = [_word_text(w).strip() for w in all_words if _word_text(w).strip()]
 
-    # zip by position — lengths should match since punctuation model only
-    # adds punctuation characters, doesn't insert or delete words
     if len(punct_tokens) != len(orig_tokens):
         print(f"Warning: punctuation token count mismatch ({len(punct_tokens)} vs {len(orig_tokens)}), skipping.")
         return all_words
 
-    # rebuild word list with punctuated tokens, preserving original timestamps
     real_idx  = 0
     new_words = []
     for w in all_words:
@@ -381,9 +340,8 @@ def _restore_punctuation(all_words: list) -> list:
         if not token:
             new_words.append(w)
             continue
-        new_w = dict(w)
-        # preserve leading space Whisper puts on words
-        leading = " " if _word_text(w).startswith(" ") else ""
+        new_w    = dict(w)
+        leading  = " " if _word_text(w).startswith(" ") else ""
         new_w["word"] = leading + punct_tokens[real_idx]
         new_words.append(new_w)
         real_idx += 1
@@ -392,33 +350,20 @@ def _restore_punctuation(all_words: list) -> list:
 
 
 # ---------------------------------------------------------------------------
-# Sentence chunking
+# Sentence chunking — returns sentences WITH their word lists
 # ---------------------------------------------------------------------------
 _SENTENCE_END_RE = re.compile(r'[.!?]["\']?$')
 _SOFT_BREAK_RE   = re.compile(r'[,;:]["\']?$')
 
-def sentence_chunk_segments(
-    segments_or_words,
-    max_words=9,
-    max_chars=60,
-    max_duration=4.0,
-    min_words=6,
-):
+def sentence_chunk_segments(all_words: list, max_words=18, max_chars=120,
+                             max_duration=8.0, min_words=4) -> list:
     """
-    Chunk a transcript into subtitle lines by breaking at punctuation boundaries.
-    Accepts either raw Whisper segments or a pre-flattened word list (e.g. after
-    punctuation restoration). Sentence endings (.!?) always trigger a break;
-    soft pauses (,;:) only break after min_words have accumulated.
+    Break the flat word list into sentences at punctuation boundaries.
+    Returns list of {start, end, text, words} — words carried for subdivision.
     """
-    # Accept either a flat word list or raw Whisper segments
-    if segments_or_words and isinstance(segments_or_words[0], dict) and "word" in segments_or_words[0]:
-        all_words = segments_or_words  # already flattened
-    else:
-        all_words = _flatten_words(segments_or_words)
-
     out: list       = []
     cur_words: list = []
-    cur_start: Optional[float] = None
+    cur_start       = None
 
     def flush():
         nonlocal cur_words, cur_start
@@ -428,7 +373,7 @@ def sentence_chunk_segments(
         start = cur_start if cur_start is not None else float(cur_words[0].get("start", 0.0))
         end   = float(cur_words[-1].get("end", 0.0))
         if text:
-            out.append({"start": start, "end": end, "text": text})
+            out.append({"start": start, "end": end, "text": text, "words": list(cur_words)})
         cur_words = []
         cur_start = None
 
@@ -446,23 +391,57 @@ def sentence_chunk_segments(
         duration   = max(0.0, w_end - cur_start)
         stripped   = token.strip()
 
-        over_limit = (
-            word_count >= max_words
-            or len(text_now) >= max_chars
-            or duration >= max_duration
-        )
+        over_limit = word_count >= max_words or len(text_now) >= max_chars or duration >= max_duration
 
         if over_limit:
-            # Hard limit — always flush
             flush()
         elif _SENTENCE_END_RE.search(stripped):
-            # Sentence ending (.!?) — always flush, even on short phrases
             flush()
         elif _SOFT_BREAK_RE.search(stripped) and word_count >= min_words:
-            # Soft pause (,;:) — only flush once enough words have built up
             flush()
 
     flush()
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Subdivision — split each sentence into equal chunks using word timestamps
+# ---------------------------------------------------------------------------
+def subdivide_segments(sentences: list, max_chars: int) -> list:
+    """
+    For each sentence, compute N = ceil(len(text) / max_chars).
+    Split the sentence's words into N equal groups.
+    Each chunk's start/end comes directly from the first/last word's timestamps.
+    Returns a flat list of {start, end, text}.
+    """
+    out = []
+    for sent in sentences:
+        words = [w for w in sent.get("words", []) if _word_text(w).strip()]
+        text  = sent["text"]
+
+        if not words:
+            out.append({"start": sent["start"], "end": sent["end"], "text": text})
+            continue
+
+        n_chunks = max(1, math.ceil(len(text) / max_chars))
+
+        if n_chunks == 1:
+            out.append({"start": sent["start"], "end": sent["end"], "text": text})
+            continue
+
+        # Split words into n_chunks equal groups
+        words_per_chunk = math.ceil(len(words) / n_chunks)
+        for i in range(0, len(words), words_per_chunk):
+            group = words[i:i + words_per_chunk]
+            if not group:
+                continue
+            chunk_text  = _join_words(group)
+            chunk_start = float(group[0].get("start", 0.0))
+            chunk_end   = float(group[-1].get("end",   0.0))
+            if chunk_end <= chunk_start:
+                chunk_end = chunk_start + 0.1
+            out.append({"start": chunk_start, "end": chunk_end, "text": chunk_text})
+
     return out
 
 
@@ -546,11 +525,9 @@ def cadence_chunk_segments(segments, max_words=7, max_chars=42, max_duration=2.6
         text  = (seg.get("text", "") or "").strip()
         if not text:
             continue
-
         phrases   = _split_text_punct(text) or [text]
         chunks    = _enforce_limits(phrases, max_words, max_chars) or [text]
         allocated = _allocate_times(start, end, chunks)
-
         for a in allocated:
             s, e, t = a["start"], a["end"], a["text"]
             if (e - s) <= max_duration:
@@ -564,7 +541,6 @@ def cadence_chunk_segments(segments, max_words=7, max_chars=42, max_duration=2.6
             per        = int(math.ceil(len(words) / n))
             sub_chunks = [" ".join(words[i:i + per]) for i in range(0, len(words), per)]
             out.extend(_allocate_times(s, e, sub_chunks))
-
     return out
 
 
@@ -609,7 +585,6 @@ def apply_fcpxml_line_breaks(fcpx_path: str, line_break_chars: int) -> bool:
     except Exception as e:
         print(f"Could not parse FCPXML for line breaks: {e}")
         return False
-
     changed = False
     for elem in tree.getroot().iter():
         raw = elem.text
@@ -618,10 +593,8 @@ def apply_fcpxml_line_breaks(fcpx_path: str, line_break_chars: int) -> bool:
             if wrapped != raw:
                 elem.text = wrapped
                 changed = True
-
     if not changed:
         return False
-
     tree.write(fcpx_path, encoding="utf-8", xml_declaration=True)
     try:
         xml_text = Path(fcpx_path).read_text(encoding="utf-8")
@@ -639,7 +612,6 @@ def modify_fcpxml(fcpx_path: str, sub: SubtitleConfig):
         return
     tree = ET.parse(fcpx_path)
     root = tree.getroot()
-
     for elem in root.iter():
         if sub.position and elem.tag.lower().endswith("param") and elem.attrib.get("name") == "Position":
             elem.set("value", sub.position)
@@ -649,7 +621,6 @@ def modify_fcpxml(fcpx_path: str, sub: SubtitleConfig):
                 elem.set("lineSpacing", str(int(sub.line_spacing)))
         if sub.fontsize and "fontSize" in elem.attrib:
             elem.set("fontSize", str(sub.fontsize))
-
     tree.write(fcpx_path, encoding="utf-8", xml_declaration=True)
     if sub.line_break_chars is not None:
         apply_fcpxml_line_breaks(fcpx_path, int(sub.line_break_chars))
@@ -751,8 +722,7 @@ def process_one(input_path: str, sub: SubtitleConfig, yt: YoutubeConfig):
     print(f"Quality preset '{resolved_quality}': model={preset.model}, beam_size={preset.beam_size}")
 
     # --- Transcribe ---
-    # MPS doesn't support float64 which Whisper's word-timestamp alignment requires.
-    # Always use CPU for transcription to ensure word timestamps work correctly.
+    # Always use CPU — MPS doesn't support float64 needed for word timestamps
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model  = whisper.load_model(preset.model, device=device)
     print(f"Transcribing with Whisper {preset.model}...")
@@ -771,38 +741,45 @@ def process_one(input_path: str, sub: SubtitleConfig, yt: YoutubeConfig):
         print("No segments found, skipping.")
         return
 
-    # --- Chunk ---
+    # --- Build word list with punctuation ---
     all_words = _flatten_words(raw_segments)
     all_words = _restore_punctuation(all_words)
 
+    # --- Chunk ---
     if sub.style == "cadence":
-        segments = cadence_chunk_segments(
+        chunks = cadence_chunk_segments(
             raw_segments,
             max_words=sub.max_words,
             max_chars=sub.max_chars,
             max_duration=sub.max_duration,
         )
-        print(f"Cadence chunking → {len(segments)} subtitle entries")
+        print(f"Cadence chunking → {len(chunks)} subtitle entries")
     else:
-        segments  = sentence_chunk_segments(
+        # 1. Find sentence boundaries (respects punctuation, carries word lists)
+        sentences = sentence_chunk_segments(
             all_words,
             max_words=sub.max_words,
             max_chars=sub.max_chars,
             max_duration=sub.max_duration,
             min_words=sub.min_words,
         )
-        print(f"Sentence chunking → {len(segments)} subtitle entries")
+        print(f"Sentence boundaries → {len(sentences)} sentences")
 
-    # --- Write SRT + FCPXML ---
-    # Word-level SRT — one entry per word with precise timestamps
+        # 2. Subdivide each sentence into equal chunks using word timestamps
+        #    N = ceil(sentence_char_length / max_chars)
+        chunks = subdivide_segments(sentences, max_chars=sub.max_chars)
+        print(f"Subdivided → {len(chunks)} subtitle entries")
+
+    # --- Write outputs ---
+    # Word-level SRT — one entry per word
     words_srt_path = os.path.join(out_folder, "subtitles_words.srt")
-    write_srt(all_words, words_srt_path)
+    write_words_srt(all_words, words_srt_path)
     print(f"Word-level SRT saved: {words_srt_path}")
 
-    # Sentence-level SRT — named subtitles.srt so srt2subtitles produces subtitles.fcpxml
+    # Sentence SRT — passed to srt2subtitles to produce FCPXML
     srt_path = os.path.join(out_folder, "subtitles.srt")
-    write_sentences_srt(segments, srt_path)
-    print(f"Sentence SRT saved: {srt_path}")
+    write_srt(chunks, srt_path)
+    print(f"Subtitle SRT saved: {srt_path}")
 
     run_srt2subtitles(srt_path, fps)
 
@@ -827,13 +804,11 @@ def main():
         description="Generate SRT + FCPXML for one input or a whole directory."
     )
 
-    # Positional / batch
     parser.add_argument("input", nargs="?", help="Local media file OR YouTube URL")
     parser.add_argument("--batch",     action="store_true", help="Process all media in --input-dir")
     parser.add_argument("--input-dir", default=_cfg(cfg, "batch", "input_dir", default="input"),
                         help="Directory to scan in batch mode")
 
-    # Subtitle style
     parser.add_argument("--style",        choices=["sentence", "cadence"],
                         default=_cfg(cfg, "style", "default", default="sentence"))
     parser.add_argument("--quality",      choices=["auto", "high", "medium", "low"],
@@ -841,12 +816,12 @@ def main():
                         help="Whisper quality preset. auto = high under 10 min, medium above (default: auto)")
     parser.add_argument("--min-words",    type=int, default=_cfg(cfg, "style", "min_words"),
                         dest="min_words",
-                        help="Fallback chunker: min words before a soft break fires (default: 6)")
+                        help="Min words before a soft/comma break fires (default: 4)")
     parser.add_argument("--max-words",    type=int,   default=_cfg(cfg, "style", "max_words"))
-    parser.add_argument("--max-chars",    type=int,   default=_cfg(cfg, "style", "max_chars"))
+    parser.add_argument("--max-chars",    type=int,   default=_cfg(cfg, "style", "max_chars"),
+                        help="Max chars per subtitle chunk — also drives subdivision (default: 40)")
     parser.add_argument("--max-duration", type=float, default=_cfg(cfg, "style", "max_duration"))
 
-    # FCPXML appearance
     parser.add_argument("--position",         type=str, default=_cfg(cfg, "fcpxml", "position"))
     parser.add_argument("--font",             type=str, default=_cfg(cfg, "fcpxml", "font"))
     parser.add_argument("--fontsize",         type=int, default=_cfg(cfg, "fcpxml", "fontsize"))
@@ -855,7 +830,6 @@ def main():
     parser.add_argument("--line-break-chars", type=int, default=_cfg(cfg, "fcpxml", "line_break_chars"),
                         dest="line_break_chars")
 
-    # YouTube
     parser.add_argument("--ytmp3",                action="store_true",
                         default=_cfg(cfg, "youtube", "ytmp3", default=False))
     parser.add_argument("--timestamp",            type=str, default=None)
