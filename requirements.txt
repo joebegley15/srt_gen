@@ -1,0 +1,4 @@
+torch
+openai-whisper
+yt-dlp
+tomli

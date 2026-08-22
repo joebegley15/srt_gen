@@ -645,17 +645,42 @@ def apply_fcpxml_line_breaks(fcpx_path: str, line_break_chars: int) -> bool:
         return False
     return True
 
+_FONT_FACES = {
+    "SemiBold", "Bold", "ExtraBold", "UltraBold",
+    "Light", "ExtraLight", "UltraLight",
+    "Medium", "Black", "Heavy", "Thin",
+    "Italic", "Regular",
+}
+_BOLD_FACES = {"Bold", "SemiBold", "ExtraBold", "UltraBold", "Black", "Heavy"}
+
+def _split_font(font_str: str):
+    """
+    Split 'Oswald SemiBold' -> ('Oswald', 'SemiBold').
+    Returns (family, face) where face may be None if no known weight word found.
+    """
+    parts = font_str.rsplit(" ", 1)
+    if len(parts) == 2 and parts[1] in _FONT_FACES:
+        return parts[0], parts[1]
+    return font_str, None
+
 def modify_fcpxml(fcpx_path: str, sub: SubtitleConfig):
     if not os.path.exists(fcpx_path):
         print("Could not modify XML, file missing:", fcpx_path)
         return
     tree = ET.parse(fcpx_path)
     root = tree.getroot()
+
+    font_family, font_face = _split_font(sub.font) if sub.font else (None, None)
+
     for elem in root.iter():
         if sub.position and elem.tag.lower().endswith("param") and elem.attrib.get("name") == "Position":
             elem.set("value", sub.position)
-        if sub.font and "font" in elem.attrib:
-            elem.set("font", sub.font)
+        if font_family and "font" in elem.attrib:
+            elem.set("font", font_family)
+            if font_face:
+                elem.set("fontFace", font_face)
+                if font_face in _BOLD_FACES:
+                    elem.set("bold", "1")
             if sub.line_spacing is not None:
                 elem.set("lineSpacing", str(int(sub.line_spacing)))
         if sub.fontsize and "fontSize" in elem.attrib:

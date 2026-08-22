@@ -203,6 +203,62 @@ This avoids Final Cut layout drift caused by literal newlines.
 
 ---
 
+## Batch MP3 + SRT (`batch_mp3_srt.py`)
+
+A lighter, second command for a different job: take a pile of long video files,
+spit out an MP3 for each (small enough to upload/share easily) and an SRT
+transcript for each, and optionally search every transcript for a key phrase.
+
+Unlike `generate_srt.py`, this does **not** produce FCPXML — it's for
+transcription/upload prep, not Final Cut captioning.
+
+### Usage
+
+```bash
+python batch_mp3_srt.py video1.mp4 video2.mov video3.mkv
+```
+
+Or process a whole folder:
+
+```bash
+python batch_mp3_srt.py --input-dir input
+```
+
+Search every transcript for a phrase and get timestamped matches back:
+
+```bash
+python batch_mp3_srt.py *.mp4 --keyphrase "sign up now"
+```
+
+### Output Structure
+
+```text
+output/<video-name>/
+├── <video-name>.mp3
+├── <video-name>.srt
+└── keyphrase_matches.txt   # only written if --keyphrase matched something in this file
+
+output/keyphrase_matches.txt  # combined report across all files, only if --keyphrase given
+```
+
+### Flags
+
+| Flag                | Description                                                        |
+| -------------------- | ------------------------------------------------------------------ |
+| `--input-dir DIR`    | Process every media file in a directory (in addition to any files passed directly) |
+| `--output-dir DIR`   | Where per-video folders are created (default: `output`)            |
+| `--quality`          | `auto` \| `high` \| `medium` \| `low` (default: `auto`)             |
+| `--style`            | `sentence` \| `cadence` (default: `sentence`)                      |
+| `--bitrate`          | MP3 bitrate (default: `192k`)                                      |
+| `--keyphrase TEXT`   | Search every transcript for this phrase, report timestamped matches |
+| `--case-sensitive`   | Make `--keyphrase` matching case-sensitive (default: off)          |
+
+It reuses the same Whisper transcription + subtitle-chunking engine as
+`generate_srt.py`, so wording/timing/chunking behave identically between the
+two tools.
+
+---
+
 ## Known Limitations and Author Notes
 
 * Whisper timing is segment‑based (not word‑level unless extended)
